@@ -1,5 +1,4 @@
 import hydra
-
 from rllm.agents.system_prompts import SEARCH_SYSTEM_PROMPT
 from rllm.agents.tool_agent import ToolAgent
 from rllm.data import DatasetRegistry
@@ -10,7 +9,11 @@ from rllm.trainer.agent_trainer import AgentTrainer
 from .local_retrieval_tool import LocalRetrievalTool
 
 
-@hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
+@hydra.main(
+    config_path="pkg://rllm.trainer.config",
+    config_name="agent_ppo_trainer",
+    version_base=None,
+)
 def main(config):
     train_dataset = DatasetRegistry.load_dataset("hotpotqa", "train")
     val_dataset = DatasetRegistry.load_dataset("hotpotqa", "test")
@@ -23,7 +26,11 @@ def main(config):
         "reward_fn": search_reward_fn,
     }
 
-    agent_args = {"system_prompt": SEARCH_SYSTEM_PROMPT, "tool_map": tool_map, "parser_name": "qwen"}
+    agent_args = {
+        "system_prompt": SEARCH_SYSTEM_PROMPT,
+        "tool_map": tool_map,
+        "parser_name": "qwen",
+    }
 
     # Use the registry-based approach (comment out the other approach)
     trainer = AgentTrainer(

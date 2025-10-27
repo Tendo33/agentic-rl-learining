@@ -21,18 +21,29 @@ def prepare_hotpotqa_data(train_size=None, test_size=None):
         if max_size is not None:
             split_data = split_data.select(range(min(max_size, len(split_data))))
         print(split_data)
-        processed = [{"question": example["question"], "ground_truth": example["answer"], "data_source": "hotpotqa"} for example in split_data]
+        processed = [
+            {
+                "question": example["question"],
+                "ground_truth": example["answer"],
+                "data_source": "hotpotqa",
+            }
+            for example in split_data
+        ]
 
         print(f"Processed {len(processed)} examples")
         return processed
 
     print("Loading HotpotQA dataset...")
-    hotpot_dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", trust_remote_code=True)
+    hotpot_dataset = load_dataset(
+        "hotpotqa/hotpot_qa", "distractor", trust_remote_code=True
+    )
 
     train_processed = process_split(hotpot_dataset["train"], train_size)
     test_processed = process_split(hotpot_dataset["validation"], test_size)
 
-    train_dataset = DatasetRegistry.register_dataset("hotpotqa", train_processed, "train")
+    train_dataset = DatasetRegistry.register_dataset(
+        "hotpotqa", train_processed, "train"
+    )
     test_dataset = DatasetRegistry.register_dataset("hotpotqa", test_processed, "test")
 
     return train_dataset.get_data(), test_dataset.get_data()

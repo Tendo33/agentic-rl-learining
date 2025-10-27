@@ -23,7 +23,9 @@ def load_search_data(train_size=3000, test_size=100):
         print("Dataset not found, preparing search dataset...")
         from prepare_hotpotqa_data import prepare_hotpotqa_data
 
-        _, test_dataset = prepare_hotpotqa_data(train_size=train_size, test_size=test_size)
+        _, test_dataset = prepare_hotpotqa_data(
+            train_size=train_size, test_size=test_size
+        )
 
     return test_dataset.get_data()
 
@@ -53,7 +55,11 @@ if __name__ == "__main__":
     engine = AgentExecutionEngine(
         agent_class=ToolAgent,
         config=config,
-        agent_args={"tool_map": tool_map, "system_prompt": SEARCH_SYSTEM_PROMPT, "parser_name": "qwen"},
+        agent_args={
+            "tool_map": tool_map,
+            "system_prompt": SEARCH_SYSTEM_PROMPT,
+            "parser_name": "qwen",
+        },
         env_class=ToolEnvironment,
         env_args={"tool_map": tool_map, "reward_fn": search_reward_fn},
         rollout_engine=None,
@@ -73,4 +79,4 @@ if __name__ == "__main__":
 
     results = asyncio.run(engine.execute_tasks(tasks[0:1]))
     print(results)
-    #save_trajectories(results, filename="search_trajectories.pt")
+    # save_trajectories(results, filename="search_trajectories.pt")

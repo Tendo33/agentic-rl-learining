@@ -55,7 +55,12 @@ def process_wikipedia_corpus(save_path: str):
                     total_size = json_member.size
                     processed = 0
 
-                    for chunk in tqdm(iter(lambda: f_in.read(chunk_size), b""), desc="Extracting corpus", total=total_size // chunk_size, unit="chunks"):
+                    for chunk in tqdm(
+                        iter(lambda: f_in.read(chunk_size), b""),
+                        desc="Extracting corpus",
+                        total=total_size // chunk_size,
+                        unit="chunks",
+                    ):
                         f_out.write(chunk)
                         processed += len(chunk)
                         if processed % (2000 * 1024 * 1024) == 0:  # print every 2GB
@@ -68,7 +73,9 @@ def process_wikipedia_corpus(save_path: str):
         with gzip.open(wiki_gz_file, "rb") as f_in:
             with open(wiki_file, "wb") as f_out:
                 chunk_size = 8192
-                for chunk in tqdm(iter(lambda: f_in.read(chunk_size), b""), desc="Extracting corpus"):
+                for chunk in tqdm(
+                    iter(lambda: f_in.read(chunk_size), b""), desc="Extracting corpus"
+                ):
                     f_out.write(chunk)
 
         print(f"Wikipedia corpus extracted to {wiki_file}")
@@ -91,7 +98,9 @@ def download_prebuilt_indices(save_path: str):
 
     try:
         print(f"Pre-built indices downloaded to {indices_dir}")
-        print("Note: You'll need to concatenate part_aa and part_ab to create the full index")
+        print(
+            "Note: You'll need to concatenate part_aa and part_ab to create the full index"
+        )
         print("Run: cat part_aa part_ab > e5_Flat.index")
 
         return indices_dir
@@ -122,13 +131,17 @@ def setup_search_data(data_dir: str = "./search_data", max_docs: int | None = No
     with open(summary_file, "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\nData setup {'completed' if summary['setup_complete'] else 'partially completed'}!")
+    print(
+        f"\nData setup {'completed' if summary['setup_complete'] else 'partially completed'}!"
+    )
     print(f"Summary saved to {summary_file}")
 
     if summary["setup_complete"]:
         print("\nNext steps:")
         print("1. Launch dense retrieval server:")
-        print("   cd examples/search && bash retrieval/launch_server.sh ./search_data/prebuilt_indices 8000")
+        print(
+            "   cd examples/search && bash retrieval/launch_server.sh ./search_data/prebuilt_indices 8000"
+        )
         print("2. Start training:")
         print("   cd examples/search && python train_search_agent.py")
 
@@ -136,9 +149,17 @@ def setup_search_data(data_dir: str = "./search_data", max_docs: int | None = No
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Process Search training data & download dense indices")
-    parser.add_argument("--data_dir", default="/mnt/public/sunjinfeng/data/search_data", help="Directory to save data")
-    parser.add_argument("--max_docs", type=int, help="Limit number of docs (for quick dev)")
+    parser = argparse.ArgumentParser(
+        description="Process Search training data & download dense indices"
+    )
+    parser.add_argument(
+        "--data_dir",
+        default="/mnt/public/sunjinfeng/data/search_data",
+        help="Directory to save data",
+    )
+    parser.add_argument(
+        "--max_docs", type=int, help="Limit number of docs (for quick dev)"
+    )
 
     args = parser.parse_args()
 

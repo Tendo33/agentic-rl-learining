@@ -20,7 +20,9 @@ class LocalRetrievalTool(Tool):
     """
 
     NAME = "local_search"
-    DESCRIPTION = "Search for information using a dense retrieval server with Wikipedia corpus"
+    DESCRIPTION = (
+        "Search for information using a dense retrieval server with Wikipedia corpus"
+    )
 
     def __init__(
         self,
@@ -59,9 +61,13 @@ class LocalRetrievalTool(Tool):
         try:
             response = self.client.get(f"{self.server_url}/health")
             if response.status_code == 200:
-                logger.info(f"Successfully connected to retrieval server at {self.server_url}")
+                logger.info(
+                    f"Successfully connected to retrieval server at {self.server_url}"
+                )
             else:
-                logger.warning(f"Retrieval server returned status code {response.status_code}")
+                logger.warning(
+                    f"Retrieval server returned status code {response.status_code}"
+                )
         except Exception as e:
             logger.warning(f"Could not connect to retrieval server: {e}")
 
@@ -76,8 +82,16 @@ class LocalRetrievalTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Search query to retrieve relevant documents"},
-                        "top_k": {"type": "integer", "description": f"Number of results to return (default: {self.max_results})", "minimum": 1, "maximum": 50},
+                        "query": {
+                            "type": "string",
+                            "description": "Search query to retrieve relevant documents",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": f"Number of results to return (default: {self.max_results})",
+                            "minimum": 1,
+                            "maximum": 50,
+                        },
                     },
                     "required": ["query"],
                 },
@@ -100,7 +114,9 @@ class LocalRetrievalTool(Tool):
             if len(content) > 300:
                 content = content[:300] + "..."
 
-            formatted_result = f"[Document {i}] (ID: {doc_id}, Score: {score:.3f})\n{content}\n"
+            formatted_result = (
+                f"[Document {i}] (ID: {doc_id}, Score: {score:.3f})\n{content}\n"
+            )
             formatted_results.append(formatted_result)
 
         return "\n".join(formatted_results)
@@ -145,20 +161,35 @@ class LocalRetrievalTool(Tool):
             results = response_data.get("results", [])
 
             if not results:
-                return ToolOutput(name=self.name, output="No relevant documents found for the query.")
+                return ToolOutput(
+                    name=self.name, output="No relevant documents found for the query."
+                )
 
             # Format results
             formatted_output = self._format_search_results(results)
 
             # Create metadata for potential downstream use
-            metadata = {"query": query, "num_results": len(results), "retriever_type": "dense", "server_url": self.server_url}
+            metadata = {
+                "query": query,
+                "num_results": len(results),
+                "retriever_type": "dense",
+                "server_url": self.server_url,
+            }
 
-            return ToolOutput(name=self.name, output=formatted_output, metadata=metadata)
+            return ToolOutput(
+                name=self.name, output=formatted_output, metadata=metadata
+            )
 
         except httpx.TimeoutException:
-            return ToolOutput(name=self.name, error=f"Request timeout after {self.timeout} seconds. Please check if the retrieval server is running.")
+            return ToolOutput(
+                name=self.name,
+                error=f"Request timeout after {self.timeout} seconds. Please check if the retrieval server is running.",
+            )
         except httpx.ConnectError:
-            return ToolOutput(name=self.name, error=f"Could not connect to retrieval server at {self.server_url}. Please ensure the server is running.")
+            return ToolOutput(
+                name=self.name,
+                error=f"Could not connect to retrieval server at {self.server_url}. Please ensure the server is running.",
+            )
         except Exception as e:
             return ToolOutput(name=self.name, error=f"Unexpected error: {str(e)}")
 
@@ -172,7 +203,9 @@ class LocalRetrievalTool(Tool):
 
 
 # Convenience function for tool registry
-def create_local_retrieval_tool(server_url: str = "http://127.0.0.1:8000", max_results: int = 10) -> LocalRetrievalTool:
+def create_local_retrieval_tool(
+    server_url: str = "http://127.0.0.1:8000", max_results: int = 10
+) -> LocalRetrievalTool:
     """
     Create a LocalRetrievalTool instance with specified configuration.
 
