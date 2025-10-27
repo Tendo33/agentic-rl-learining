@@ -21,7 +21,7 @@ mkdir -p ${LOG_DIR}
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 
 # Run the training script with the specified configuration
-python3 -m examples.search.train_search_agent \
+python3 -m rllm-search-agent.train_search_agent \
     algorithm.adv_estimator=rloo \
     data.train_batch_size=64 \
     data.val_batch_size=128 \

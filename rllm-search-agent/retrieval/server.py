@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +20,13 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 class LocalRetriever:
@@ -36,27 +44,40 @@ class LocalRetriever:
 
     def _load_data(self):
         """Load corpus and dense index from data directory."""
-        print(f"Loading data from {self.data_dir}")
+        logger.info(f"Loading data from {self.data_dir}")
 
         # Load corpus
         corpus_file = self.data_dir / "../wikipedia/wiki-18.jsonl"
-        print(f"Attempting to load corpus from {corpus_file}")
+        logger.info(f"Loading corpus from {corpus_file}")
+
+        start_time = time.time()
         try:
             # 尝试使用 UTF-8 编码，并忽略无法解码的错误字符
             with open(corpus_file, encoding="utf-8", errors="ignore") as f:
                 self.corpus = [json.loads(line) for line in f]
+            logger.info(f"Loaded {len(self.corpus)} documents from corpus")
         except UnicodeDecodeError:
             # 如果失败，尝试使用更宽松的编码，例如 Latin-1（它能处理 0x80）
-            print("UTF-8 decoding failed. Trying Latin-1 encoding...")
+            logger.warning("UTF-8 decoding failed. Trying Latin-1 encoding...")
             with open(corpus_file, encoding="latin-1") as f:
-                # 注意：使用 Latin-1 可能会导致一些字符被错误解析，
-                # 但能避免初始化失败。
                 self.corpus = [json.loads(line) for line in f]
+            logger.info(f"Loaded {len(self.corpus)} documents from corpus (Latin-1)")
+
+        corpus_load_time = time.time() - start_time
+        logger.info(f"Corpus loading took {corpus_load_time:.2f} seconds")
 
         # Load dense index
         dense_index_file = self.data_dir / "e5_Flat.index"
+        logger.info(f"Loading dense index from {dense_index_file}")
+
+        index_start = time.time()
         self.dense_index = faiss.read_index(str(dense_index_file))
-        print(f"Loaded dense index with {self.dense_index.ntotal} vectors")
+        index_load_time = time.time() - index_start
+
+        logger.info(
+            f"Loaded dense index with {self.dense_index.ntotal} vectors "
+            f"in {index_load_time:.2f} seconds"
+        )
 
     def search(self, query: str, k: int = 10) -> list[dict[str, Any]]:
         """Dense retrieval using FAISS."""
@@ -109,17 +130,54 @@ class HealthResponse(BaseModel):
     index_loaded: bool = Field(..., description="Whether index is loaded")
 
 
-# Global retriever instance
+# Global retriever instance and config
 retriever: LocalRetriever | None = None
+config = {
+    "data_dir": "/mnt/public/sunjinfeng/data/search_data/prebuilt_indices",
+}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager for FastAPI app."""
-    # Startup: retriever is already initialized in main()
+    """
+    Lifecycle manager for FastAPI app.
+
+    Handles initialization and cleanup of the retriever instance.
+    This ensures the retriever is loaded once per worker process.
+    """
+    global retriever
+
+    # Startup: Initialize retriever
+    logger.info("=" * 60)
+    logger.info("Starting FastAPI Dense Retrieval Server")
+    logger.info("=" * 60)
+
+    if config["data_dir"] is None:
+        logger.error("Data directory not configured!")
+        raise ValueError("Data directory must be set before starting server")
+
+    start_time = time.time()
+    try:
+        logger.info(f"Initializing retriever with data_dir: {config['data_dir']}")
+        retriever = LocalRetriever(config["data_dir"])
+        elapsed = time.time() - start_time
+        logger.info(f"✓ Retriever initialized successfully in {elapsed:.2f} seconds")
+        logger.info(f"✓ Loaded {len(retriever.corpus)} documents")
+        logger.info(f"✓ Dense index size: {retriever.dense_index.ntotal} vectors")
+    except Exception as e:
+        logger.error(f"✗ Failed to initialize retriever: {e}")
+        raise
+
+    logger.info("=" * 60)
+    logger.info("Server ready to accept requests")
+    logger.info("=" * 60)
+
     yield
-    # Shutdown: cleanup if needed
-    pass
+
+    # Shutdown: cleanup resources
+    logger.info("Shutting down retriever...")
+    retriever = None
+    logger.info("Retriever shutdown complete")
 
 
 # FastAPI app
@@ -190,45 +248,100 @@ async def retrieve(request: RetrievalRequest):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dense-only retrieval server")
+    """
+    Main entry point for the retrieval server.
+
+    Configures and starts the FastAPI server with proper lifespan management.
+    """
+    parser = argparse.ArgumentParser(
+        description="Dense-only retrieval server with FastAPI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Start with default settings
+  python server.py
+  
+  # Custom data directory and port
+  python server.py --data_dir /path/to/data --port 8080
+  
+  # Production mode with multiple workers
+  python server.py --workers 4 --host 0.0.0.0
+  
+  # Development mode with auto-reload (single worker only)
+  python server.py --reload --workers 1
+        """,
+    )
     parser.add_argument(
         "--data_dir",
-        default="mnt/public/sunjinfeng/data/search_data/prebuilt_indices",
+        default="/mnt/public/sunjinfeng/data/search_data/prebuilt_indices",
         help="Directory containing corpus and dense index",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=2727, help="Port to bind to")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload mode")
     parser.add_argument(
-        "--workers", type=int, default=10, help="Number of worker processes"
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind to (use 0.0.0.0 for external access)",
+    )
+    parser.add_argument("--port", type=int, default=2727, help="Port to bind to")
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable auto-reload mode (development only, forces workers=1)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes (note: each worker loads the model separately)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="Logging level",
     )
 
     args = parser.parse_args()
 
-    start_time = time.time()
-    # Initialize retriever
-    global retriever
-    try:
-        retriever = LocalRetriever(args.data_dir)
-        print(
-            f"Dense retrieval server initialized with {len(retriever.corpus)} documents"
-        )
-    except Exception as e:
-        print(f"Failed to initialize retriever: {e}")
-        return
+    # Validate arguments
+    if args.reload and args.workers > 1:
+        logger.warning("Auto-reload mode requires single worker. Setting workers=1")
+        args.workers = 1
 
-    # Start server
-    elapsed_time = time.time() - start_time
-    print(f"Took {elapsed_time:.2f} seconds to initialize the server")
-    print(f"Starting dense retrieval server on {args.host}:{args.port}")
-    print(f"API documentation available at http://{args.host}:{args.port}/docs")
+    # Set configuration for lifespan
+    config["data_dir"] = args.data_dir
+
+    # Log startup info
+    logger.info("=" * 60)
+    logger.info("Dense Retrieval Server Configuration")
+    logger.info("=" * 60)
+    logger.info(f"Data directory: {args.data_dir}")
+    logger.info(f"Host: {args.host}")
+    logger.info(f"Port: {args.port}")
+    logger.info(f"Workers: {args.workers}")
+    logger.info(f"Reload mode: {args.reload}")
+    logger.info(f"Log level: {args.log_level}")
+    logger.info("=" * 60)
+
+    if args.workers > 1:
+        logger.warning(
+            f"⚠️  Running with {args.workers} workers. "
+            "Each worker will load its own copy of the model and index!"
+        )
+        logger.warning("⚠️  Consider reducing workers to save memory if not needed.")
+
+    # Start server (lifespan will handle retriever initialization)
+    logger.info(f"Starting server on {args.host}:{args.port}")
+    logger.info(f"📚 API documentation: http://{args.host}:{args.port}/docs")
+    logger.info(f"🏥 Health check: http://{args.host}:{args.port}/health")
+    logger.info("=" * 60)
 
     uvicorn.run(
         "retrieval.server:app",
         host=args.host,
         port=args.port,
         reload=args.reload,
-        workers=args.workers,
+        workers=args.workers if not args.reload else 1,
+        log_level=args.log_level,
     )
 
 
