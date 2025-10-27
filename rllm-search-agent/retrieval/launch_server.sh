@@ -30,7 +30,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 # Parse arguments
 DATA_DIR=${1:-"/mnt/public/sunjinfeng/data/search_data/prebuilt_indices"}
 PORT=${2:-2727}
-WORKERS=${3:-10}
+WORKERS=${3:-1}  # Default to 1 worker to avoid OOM! Each worker uses ~85GB
 MODE=${4:-""}
 LOG_LEVEL=${LOG_LEVEL:-"info"}
 
@@ -81,18 +81,34 @@ fi
 echo "✓ All dependencies installed"
 echo ""
 
-# Warning about workers
+# Critical warning about workers and memory usage
 if [ "$WORKERS" -gt 1 ]; then
-    echo "⚠️  WARNING: Running with $WORKERS workers"
-    echo "⚠️  Each worker will load its own copy of the model and index!"
-    echo "⚠️  This will multiply memory usage by $WORKERS"
-    echo "⚠️  Consider using 1 worker unless you need high concurrency"
+    MEMORY_ESTIMATE=$((WORKERS * 85))
     echo ""
-    read -p "Continue with $WORKERS workers? (y/N) " -n 1 -r
+    echo "=========================================="
+    echo "🚨 CRITICAL MEMORY WARNING 🚨"
+    echo "=========================================="
+    echo "⚠️  You requested $WORKERS workers"
+    echo "⚠️  Each worker loads ~85GB (E5 model + FAISS index)"
+    echo "⚠️  Total estimated memory: ~${MEMORY_ESTIMATE}GB"
+    echo ""
+    echo "💡 This caused your previous OOM error!"
+    echo "💡 For most use cases, 1 worker is sufficient"
+    echo "💡 uvicorn handles async requests efficiently with 1 worker"
+    echo ""
+    echo "Only use multiple workers if:"
+    echo "  - You have 85GB+ free memory per worker"
+    echo "  - You need extreme high concurrency (1000+ req/s)"
+    echo "  - Your server has 500GB+ total memory"
+    echo "=========================================="
+    echo ""
+    read -p "Are you SURE you want $WORKERS workers? (y/N) " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Aborted."
-        exit 1
+        echo ""
+        echo "✅ Good choice! Defaulting to 1 worker..."
+        WORKERS=1
+        echo ""
     fi
 fi
 
