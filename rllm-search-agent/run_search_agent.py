@@ -3,14 +3,13 @@ import os
 
 from dotenv import load_dotenv
 from local_retrieval_tool import LocalRetrievalTool
-from transformers import AutoTokenizer
-
 from rllm.agents.system_prompts import SEARCH_SYSTEM_PROMPT
 from rllm.agents.tool_agent import ToolAgent
 from rllm.data.dataset import DatasetRegistry
 from rllm.engine.agent_execution_engine import AgentExecutionEngine
 from rllm.environments.tools.tool_env import ToolEnvironment
 from rllm.rewards.reward_fn import search_reward_fn
+from transformers import AutoTokenizer
 
 
 def load_search_data(train_size=3000, test_size=100):
