@@ -33,28 +33,42 @@ export WANDB_API_KEY=...                              # W&B日志记录
 
 ### 1.2 训练器初始化 (`train_search_agent.py`)
 
+**代码位置**: `rllm/examples/search/train_search_agent.py`
+
 ```python
-# 1. 加载数据集
+# 第15-16行: 加载数据集
 train_dataset = DatasetRegistry.load_dataset("hotpotqa", "train")
+val_dataset = DatasetRegistry.load_dataset("hotpotqa", "test")
 # 从 /root/github_project/rllm/rllm/data/datasets/hotpotqa/train.parquet 加载
 
-# 2. 配置工具映射
+# 第18行: 配置工具映射
 tool_map = {"local_search": LocalRetrievalTool}
 # LocalRetrievalTool 连接到 RETRIEVAL_SERVER_URL 的检索服务
 
-# 3. 配置环境参数
+# 第20-24行: 配置环境参数
 env_args = {
     "max_steps": 20,                    # 最多20步
     "tool_map": tool_map,               # 工具映射
-    "reward_fn": search_reward_fn,      # 奖励函数
+    "reward_fn": search_reward_fn,      # 奖励函数 (来自 rllm/rewards/reward_fn.py:62)
 }
 
-# 4. 配置Agent参数
-agent_args = {
-    "system_prompt": SEARCH_SYSTEM_PROMPT,  # 系统提示词
-    "tool_map": tool_map,                   # 工具映射
-    "parser_name": "qwen"                   # 使用Qwen格式解析器
-}
+# 第26行: 配置Agent参数
+agent_args = {"system_prompt": SEARCH_SYSTEM_PROMPT, "tool_map": tool_map, "parser_name": "qwen"}
+# SEARCH_SYSTEM_PROMPT 定义在 rllm/agents/system_prompts.py
+
+# 第29-37行: 创建训练器
+trainer = AgentTrainer(
+    agent_class=ToolAgent,        # rllm/agents/tool_agent.py:17
+    env_class=ToolEnvironment,    # rllm/environments/tools/tool_env.py:12
+    config=config,
+    train_dataset=train_dataset,
+    val_dataset=val_dataset,
+    agent_args=agent_args,
+    env_args=env_args,
+)
+
+# 第39行: 开始训练
+trainer.train()  # 调用 rllm/trainer/agent_trainer.py:68-90
 ```
 
 ### 1.3 系统提示词 (`SEARCH_SYSTEM_PROMPT`)
@@ -164,8 +178,19 @@ batch = batch.repeat(repeat_times=8, interleave=True)
 
 ### 3.1 环境初始化
 
+**代码位置**: `rllm/engine/agent_execution_engine.py:506-509`
+
 ```python
-# 为每个批次项创建环境
+# 在 AgentExecutionEngine.execute_tasks 方法中创建环境和Agent
+# 第506行: 从任务字典创建环境实例
+self.envs[index] = self.env_class.from_dict({**task, **self.env_args})
+# 调用 ToolEnvironment.from_dict (rllm/environments/tools/tool_env.py:145-150)
+
+# 第507行: 创建Agent实例
+self.agents[index] = self.agent_class(**self.agent_args)
+# 调用 ToolAgent.__init__ (rllm/agents/tool_agent.py:23-61)
+
+# 具体的初始化过程：
 env = ToolEnvironment(
     task={
         "question": "Which magazine was started first Arthur's Magazine or First for Women?",
@@ -173,16 +198,17 @@ env = ToolEnvironment(
         "data_source": "hotpotqa"
     },
     tool_map={"local_search": LocalRetrievalTool},
-    reward_fn=search_reward_fn,
+    reward_fn=search_reward_fn,  # rllm/rewards/reward_fn.py:62-81
     max_steps=20
 )
+# ToolEnvironment.__init__ 在 rllm/environments/tools/tool_env.py:17-47
 
-# 为每个批次项创建Agent
 agent = ToolAgent(
     system_prompt=SEARCH_SYSTEM_PROMPT,
     tool_map={"local_search": LocalRetrievalTool},
     parser_name="qwen"
 )
+# ToolAgent.__init__ 在 rllm/agents/tool_agent.py:23-61
 ```
 
 ### 3.2 并发与批次规模
@@ -216,10 +242,13 @@ max_env_workers = 64  # 最多64个线程并发执行环境操作（工具调用
 
 ### 3.3 初始状态
 
+**代码位置**: `rllm/engine/agent_execution_engine.py:168-209`
+
 现在让我们追踪**单条轨迹**的完整过程（从512条中选一条）：
 
 ```python
 # ========== 环境初始化 ==========
+# 在 AgentExecutionEngine.run_agent_trajectory_async 方法中
 env = ToolEnvironment(
     task={
         "id": 0,
@@ -247,7 +276,10 @@ agent = ToolAgent(
 # - agent.tool_parser: QwenToolParser  # 解析器
 
 # ========== 环境重置 ==========
-observation, info = env.reset()
+# 第191行: 异步调用环境重置
+loop = asyncio.get_event_loop()
+observation, info = await loop.run_in_executor(self.executor, env.reset)
+# env.reset 定义在 rllm/environments/tools/tool_env.py:49-53
 
 # 返回值：
 observation = {
@@ -256,7 +288,9 @@ observation = {
 info = {}
 
 # ========== Agent重置 ==========
+# 第195行: 重置Agent状态
 agent.reset()
+# agent.reset 定义在 rllm/agents/tool_agent.py:153-156
 
 # 重置后的agent.messages：
 agent.messages = [
@@ -307,16 +341,19 @@ agent._trajectory = Trajectory(
 )
 
 # ========== Agent处理初始观察 ==========
+# 第196-202行: Agent根据环境反馈更新状态
 agent.update_from_env(
     observation=observation,
     reward=0.0,
     done=False,
     info=info
 )
+# agent.update_from_env 定义在 rllm/agents/tool_agent.py:86-100
 
 # update_from_env做了什么？
-# 1. 格式化observation为消息
+# 1. 格式化observation为消息 (第93行)
 obs_messages = agent._format_observation_as_messages(observation)
+# _format_observation_as_messages 定义在 rllm/agents/tool_agent.py:63-84
 # obs_messages = [
 #     {"role": "user", "content": "Which magazine was started first Arthur's Magazine or First for Women?"}
 # ]
@@ -371,29 +408,42 @@ agent.messages = [
 
 #### **第1步：模型生成工具调用**
 
+**代码位置**: `rllm/engine/agent_execution_engine.py:211-243`
+
 ```python
 # ========== 1. 构造提示词 ==========
-prompt_messages = agent.chat_completions  # 获取当前对话历史
+# 第213行: 获取当前对话历史
+prompt_messages = agent.chat_completions  # agent.chat_completions 定义在 rllm/agents/tool_agent.py:159-161
 # prompt_messages = [
 #   {"role": "system", "content": "...system prompt + tools..."},
 #   {"role": "user", "content": "Which magazine was started first Arthur's Magazine or First for Women?"}
 # ]
 
 # ========== 2. 通过Verl引擎调用模型 ==========
-# 这是异步调用，512条轨迹并发进行
-response = await rollout_engine.get_model_response(
-    prompt_messages,
-    application_id="trajectory_001",  # 轨迹唯一标识
-    max_tokens=2048,
-    temperature=0.7
-)
+# 第231行: 异步调用模型生成响应
+response = await self.get_model_response(prompt_messages, application_id, **kwargs)
+# self.get_model_response 定义在 rllm/engine/agent_execution_engine.py:120-151
+
+# 对于Verl引擎，会调用：
+# VerlEngine.get_model_response (rllm/engine/rollout/verl_engine.py:42-83)
 
 # 内部流程（vLLM引擎）：
-# 1. 将prompt_messages转换为token序列
-# 2. 添加到vLLM的请求队列
+# 1. 第56行: 将prompt_messages转换为token序列
+#    prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, ...)
+#    prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+# 
+# 2. 第63行: 添加到vLLM的请求队列并异步生成
+#    completion_ids = await self.server_manager.generate(
+#        request_id=application_id, 
+#        prompt_ids=prompt_ids, 
+#        sampling_params=sampling_params
+#    )
+#    # server_manager 在 verl/experimental/agent_loop/agent_loop.py 中定义
+# 
 # 3. vLLM动态批处理多个请求
 # 4. GPU执行推理
-# 5. 返回生成的文本
+# 5. 第70行: 解码生成的token为文本
+#    completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
 
 # ========== 3. 模型生成的响应（完整示例）==========
 response = """I need to search for information about these two magazines to determine which was started first. Let me search for Arthur's Magazine first.
@@ -411,14 +461,19 @@ response = """I need to search for information about these two magazines to dete
 
 #### **第2步：解析工具调用**
 
+**代码位置**: `rllm/agents/tool_agent.py:102-151` & `rllm/engine/agent_execution_engine.py:243-244`
+
 ```python
 # ========== Agent更新状态 ==========
-action = agent.update_from_model(response)
+# 第243行 (engine): 调用Agent的update_from_model方法
+action: Action = agent.update_from_model(response)
+action = action.action
 
-# update_from_model内部流程：
+# update_from_model内部流程 (rllm/agents/tool_agent.py:102-151)：
 
-# 1. 使用Qwen解析器提取工具调用
+# 1. 第111行: 使用Qwen解析器提取工具调用
 tool_calls = agent.tool_parser.parse(response)
+# tool_parser.parse 由具体的解析器实现，例如 QwenToolParser
 # 输入: """I need to search...<tool_call>{"name": "local_search", ...}</tool_call>"""
 # 输出: [
 #   ToolCall(
@@ -430,19 +485,26 @@ tool_calls = agent.tool_parser.parse(response)
 #   )
 # ]
 
-# 2. 为每个工具调用生成唯一ID
+# 2. 第112-119行: 为每个工具调用生成唯一ID
 tool_calls_dict = [
     {
-        "id": "call_a1b2c3d4",  # 生成UUID
+        "id": str(uuid.uuid4()),  # 第114行: 生成UUID
         "type": "function",
-        "function": {
-            "name": "local_search",
-            "arguments": '{"query": "Arthur\'s Magazine history founding date publication", "top_k": 5}'
-        }
+        "function": tool_call.to_dict(),  # 第116行: 转换为字典
     }
+    for tool_call in tool_calls
 ]
+# 实际生成的结构：
+# [{
+#     "id": "call_a1b2c3d4",
+#     "type": "function",
+#     "function": {
+#         "name": "local_search",
+#         "arguments": '{"query": "Arthur\'s Magazine history founding date publication", "top_k": 5}'
+#     }
+# }]
 
-# 3. 更新agent.messages
+# 3. 第146行: 更新agent.messages
 assistant_message = {
     "role": "assistant",
     "content": """I need to search for information about these two magazines to determine which was started first. Let me search for Arthur's Magazine first.
@@ -459,22 +521,22 @@ agent.messages.append(assistant_message)
 #   {"role": "assistant", "content": "I need to search...<tool_call>..."}
 # ]
 
-# 4. 创建新的Step并添加到Trajectory
+# 4. 第148行: 创建新的Step并添加到Trajectory
 new_step = Step(
-    chat_completions=copy.deepcopy(agent.messages),  # 保存当前对话历史快照
+    chat_completions=copy.deepcopy(self.chat_completions),  # 保存当前对话历史快照
     action=tool_calls_dict,  # 工具调用
     model_response=response,  # 原始模型输出
-    observation=agent.current_observation,  # 当前观察
-    reward=0.0,  # 初始化为0
-    done=False,
-    info={}
+    observation=self.current_observation,  # 当前观察
+    # reward, done, info 将在下一次 update_from_env 时更新
 )
-agent._trajectory.steps.append(new_step)
+# 第149行: 添加到轨迹
+self._trajectory.steps.append(new_step)
 
 # 现在agent._trajectory.steps = [Step1]
 
-# 5. 返回Action
-action = Action(action=tool_calls_dict)
+# 5. 第151行: 返回Action对象
+return Action(action=tool_calls_dict)
+# Action 定义在 rllm/agents/agent.py
 # action.action = [
 #   {
 #     "id": "call_a1b2c3d4",
@@ -486,24 +548,35 @@ action = Action(action=tool_calls_dict)
 
 #### **第3步：执行工具调用**
 
+**代码位置**: `rllm/environments/tools/tool_env.py:55-142` & `rllm/engine/agent_execution_engine.py:246-264`
+
 ```python
 # ========== 环境执行工具调用 ==========
-next_observation, reward, done, info = env.step(action.action)
+# 第250行 (engine): 异步调用环境的step方法
+next_observation, reward, done, info = await asyncio.wait_for(
+    loop.run_in_executor(self.executor, env.step, action), 
+    timeout=(self.trajectory_timeout - total_time)
+)
 
-# env.step内部流程：
+# env.step内部流程 (rllm/environments/tools/tool_env.py:55-109)：
 
-# 1. 增加步数计数
-env.step_count += 1  # 现在 = 1
+# 1. 第70行: 增加步数计数
+self.step_count += 1  # 现在 = 1
 
-# 2. 检查是否是finish工具调用
-done = False  # 不是finish，继续
-for tool_call in action.action:
-    if tool_call.get("function", {}).get("name") == "finish":
-        done = True
-        break
+# 2. 第74-80行: 检查是否是finish工具调用
+done = self.step_count >= self.max_steps or isinstance(action, str)
+if isinstance(action, list) and action:
+    for tool_call in action:
+        if tool_call.get("function", {}).get("name") == "finish":
+            done = True
+            break
 
-# 3. 并行执行所有工具调用（使用线程池）
-tool_outputs = {}
+# 如果是finish，跳转到第82-101行计算奖励
+# 如果不是finish，继续执行工具
+
+# 3. 第105行: 并行执行所有工具调用
+tool_outputs = self._execute_tool_calls(tool_calls)
+# _execute_tool_calls 定义在第111-142行，使用线程池并发执行
 
 # 对于我们的例子，只有一个工具调用
 tool_call = action.action[0]
@@ -520,8 +593,18 @@ tool_name = tool_call["function"]["name"]  # "local_search"
 tool_args = json.loads(tool_call["function"]["arguments"])
 # {"query": "Arthur's Magazine history founding date publication", "top_k": 5}
 
-# 4. 调用LocalRetrievalTool
-tool_instance = env.tools(tool_name=tool_name, **tool_args)
+# 4. 第119-122行 (_execute_tool_calls内部): 调用工具
+def execute_tool(tool_call):
+    tool_name = tool_call["function"]["name"]
+    tool_args = json.loads(tool_call["function"]["arguments"])
+    tool_output = self.tools(tool_name=tool_name, **tool_args)
+    # self.tools 是 MultiTool 实例 (定义在 rllm/tools/multi_tool.py)
+    # MultiTool.__call__ 会根据 tool_name 查找并实例化对应的工具类
+    # 然后调用 tool.forward(**tool_args)
+    
+    tool_output_str = tool_output.to_string()
+    output_queue.put((tool_call["id"], tool_output_str))
+
 # 等价于：
 # tool = LocalRetrievalTool()
 # output = tool.forward(query="Arthur's Magazine...", top_k=5)
@@ -627,19 +710,23 @@ return next_observation, reward, done, info
 
 #### **第4步：Agent处理工具输出**
 
+**代码位置**: `rllm/engine/agent_execution_engine.py:268-274` & `rllm/agents/tool_agent.py:86-100`
+
 ```python
 # ========== Agent更新状态 ==========
+# 第268-274行 (engine): 更新Agent内部状态
 agent.update_from_env(
     observation=next_observation,
-    reward=0,
-    done=False,
-    info=info
+    reward=reward,
+    done=done,
+    info=info,
 )
 
-# update_from_env内部：
+# update_from_env内部 (rllm/agents/tool_agent.py:86-100)：
 
-# 1. 格式化observation为消息
-obs_messages = agent._format_observation_as_messages(next_observation)
+# 1. 第93行: 格式化observation为消息
+obs_messages = self._format_observation_as_messages(observation)
+# _format_observation_as_messages 会检测 observation 类型
 # next_observation = {"tool_outputs": {"call_a1b2c3d4": "Tool: local_search\n..."}}
 
 # 对于tool_outputs类型的observation：
@@ -800,27 +887,41 @@ action = agent.update_from_model(response)
 
 #### **第10步：环境终止并计算奖励**
 
+**代码位置**: `rllm/environments/tools/tool_env.py:74-101` & `rllm/rewards/search_reward.py:233-254`
+
 ```python
 # ========== 环境检测finish ==========
+# 再次调用 env.step，这次检测到finish
 next_observation, reward, done, info = env.step(action.action)
 
-# env.step内部：
-env.step_count = 3
+# env.step内部 (rllm/environments/tools/tool_env.py:74-101)：
+self.step_count += 1  # 第70行: = 3
 
-# 检测到finish工具调用
-done = True
-for tool_call in action.action:
-    if tool_call.get("function", {}).get("name") == "finish":
-        done = True
-        # 提取finish的arguments
-        arguments = json.loads(tool_call["function"]["arguments"])
+# 第74-80行: 检测到finish工具调用
+done = self.step_count >= self.max_steps or isinstance(action, str)
+if isinstance(action, list) and action:
+    for tool_call in action:
+        if tool_call.get("function", {}).get("name") == "finish":
+            done = True
+            break
+
+# 第82-97行: 处理终止情况
+if done:
+    # 第86-97行: 提取finish的arguments
+    finish_action = None
+    for tool_call in action:
+        if tool_call.get("function", {}).get("name") == "finish":
+            finish_action = tool_call
+            break
+    if finish_action:
+        arguments = finish_action.get("function", {}).get("arguments", {})
         llm_response = arguments.get("response", "")
-        break
 
 # llm_response = "\\boxed{Arthur's Magazine}"
 
 # ========== 调用奖励函数 ==========
-task_info = env.task
+# 第99-100行: 调用奖励函数
+task_info = self.task
 # {
 #   "id": 0,
 #   "question": "Which magazine was started first Arthur's Magazine or First for Women?",
@@ -828,15 +929,36 @@ task_info = env.task
 #   "data_source": "hotpotqa"
 # }
 
-reward_output = reward_fn(task_info=task_info, action=llm_response)
+reward_output = self.reward_fn(task_info=task_info, action=llm_response)
+# reward_fn 是 search_reward_fn (rllm/rewards/reward_fn.py:62-81)
+# 实际调用 RewardSearchFn.__call__ (rllm/rewards/search_reward.py:233-254)
 
-# reward_fn内部（详见第四章）：
-# 1. 提取答案：unbox("\\boxed{Arthur's Magazine}") -> "Arthur's Magazine"
-# 2. 标准化：normalize("Arthur's Magazine") -> "arthurs magazine"
-# 3. 计算EM：normalize(pred) == normalize(gt) -> True
-# 4. 计算F1：1.0
-# 5. 判断正确：is_correct = True
-# 6. 赋予奖励：reward = 1.0
+# reward_fn内部流程（详见第四章）：
+# 1. 第186行: 提取答案
+#    extracted_answer = self.extract_answer_from_response(model_response)
+#    # extract_answer_from_response 定义在第58-183行
+#    # 使用 unbox 函数提取 \boxed{} 内容 (第69-85行)
+#    unbox("\\boxed{Arthur's Magazine}") -> "Arthur's Magazine"
+# 
+# 2. 第205-213行: 计算 Exact Match
+#    em = self.exact_match_score(extracted_answer, gt_str)
+#    # normalize("Arthur's Magazine") == normalize("Arthur's Magazine")
+#    # "arthurs magazine" == "arthurs magazine"  -> True
+# 
+# 3. 第216行: 计算 F1 Score
+#    f1, precision, recall = self.f1_score(extracted_answer, gt_str)
+#    # f1_score 定义在第31-52行
+#    # F1 = 1.0
+# 
+# 4. 第227行: 判断是否正确
+#    is_correct = max_em or max_f1 >= f1_threshold  # True
+# 
+# 5. 第241-250行: 赋予奖励
+#    if is_correct:
+#        if metadata.get("exact_match", False):
+#            reward = self.config.correct_reward  # 1.0
+#    else:
+#        reward = self.config.incorrect_reward  # 0.0
 
 reward_output = RewardOutput(
     reward=1.0,
@@ -1038,13 +1160,22 @@ avg_reward = sum(r.reward for r in results) / 512  # 0.449
 
 ### 4.1 答案提取 (`extract_answer_from_response`)
 
+**代码位置**: `rllm/rewards/search_reward.py:58-183`
+
 奖励函数首先从模型输出中提取答案，按优先级顺序：
 
 ```python
 llm_response = "\\boxed{Arthur's Magazine}"
 
-# 1. 最高优先级：提取 \boxed{} 内容
-def unbox(s: str):
+# extract_answer_from_response 方法 (第58-183行)
+# 第59行: 清理响应文本
+response = response.strip()
+
+# 第62-63行: 移除thinking标签
+response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+
+# 1. 最高优先级：提取 \boxed{} 内容 (第68-90行)
+def unbox(s: str):  # 第69行
     i = s.find("boxed{")
     if i == -1:
         return None
@@ -1071,13 +1202,30 @@ extracted_answer = unbox(llm_response)
 
 ### 4.2 答案标准化 (`normalize_answer`)
 
+**代码位置**: `rllm/rewards/search_reward.py:13-29`
+
 ```python
-def normalize_answer(s: str) -> str:
-    s = s.lower()                          # 转小写
-    s = remove_punc(s)                     # 移除标点
-    s = re.sub(r"\b(a|an|the)\b", " ", s) # 移除冠词
-    s = white_space_fix(s)                 # 规范空白
-    return s
+# normalize_answer 方法 (第13-29行)
+def normalize_answer(self, s: str) -> str:
+    # 第16-17行: 定义移除冠词的辅助函数
+    def remove_articles(text):
+        return re.sub(r"\b(a|an|the)\b", " ", text)
+    
+    # 第19-20行: 规范空白
+    def white_space_fix(text):
+        return " ".join(text.split())
+    
+    # 第22-24行: 移除标点
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return "".join(ch for ch in text if ch not in exclude)
+    
+    # 第26-27行: 转小写
+    def lower(text):
+        return text.lower()
+    
+    # 第29行: 应用所有转换
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 # 示例：
 # "Arthur's Magazine" -> "arthurs magazine"
@@ -1088,9 +1236,13 @@ def normalize_answer(s: str) -> str:
 
 #### **Exact Match (EM)**
 
+**代码位置**: `rllm/rewards/search_reward.py:54-56`
+
 ```python
-def exact_match_score(prediction, ground_truth):
-    return normalize_answer(prediction) == normalize_answer(ground_truth)
+# exact_match_score 方法 (第54-56行)
+def exact_match_score(self, prediction: str, ground_truth: str) -> bool:
+    """Calculate exact match score"""
+    return self.normalize_answer(prediction) == self.normalize_answer(ground_truth)
 
 # 我们的例子：
 # normalize("Arthur's Magazine") == normalize("Arthur's Magazine")
@@ -1100,24 +1252,46 @@ def exact_match_score(prediction, ground_truth):
 
 #### **F1 Score**
 
+**代码位置**: `rllm/rewards/search_reward.py:31-52`
+
 ```python
-def f1_score(prediction, ground_truth):
-    pred_tokens = normalize_answer(prediction).split()
-    gt_tokens = normalize_answer(ground_truth).split()
+# f1_score 方法 (第31-52行)
+def f1_score(self, prediction: str, ground_truth: str) -> tuple[float, float, float]:
+    """Calculate F1 score between prediction and ground truth"""
+    # 第33-34行: 标准化预测和真实答案
+    normalized_prediction = self.normalize_answer(prediction)
+    normalized_ground_truth = self.normalize_answer(ground_truth)
+    
+    # 第36行: 定义零分指标
+    ZERO_METRIC = (0, 0, 0)
+    
+    # 第38-41行: 处理yes/no/noanswer的特殊情况
+    if normalized_prediction in ["yes", "no", "noanswer"] and normalized_prediction != normalized_ground_truth:
+        return ZERO_METRIC
+    if normalized_ground_truth in ["yes", "no", "noanswer"] and normalized_prediction != normalized_ground_truth:
+        return ZERO_METRIC
+    
+    # 第43-44行: 分词
+    pred_tokens = normalized_prediction.split()
+    gt_tokens = normalized_ground_truth.split()
     
     # pred_tokens = ["arthurs", "magazine"]
     # gt_tokens = ["arthurs", "magazine"]
     
+    # 第45-46行: 计算共同token数量
     common = Counter(pred_tokens) & Counter(gt_tokens)
     num_same = sum(common.values())  # 2
     
+    # 第47-48行: 没有共同token则返回零分
     if num_same == 0:
-        return 0, 0, 0
+        return ZERO_METRIC
     
-    precision = num_same / len(pred_tokens)  # 2/2 = 1.0
-    recall = num_same / len(gt_tokens)       # 2/2 = 1.0
+    # 第49-51行: 计算精确率、召回率和F1
+    precision = 1.0 * num_same / len(pred_tokens)  # 2/2 = 1.0
+    recall = 1.0 * num_same / len(gt_tokens)       # 2/2 = 1.0
     f1 = (2 * precision * recall) / (precision + recall)  # 1.0
     
+    # 第52行: 返回三个指标
     return f1, precision, recall
 
 # 我们的例子：F1 = 1.0
@@ -1171,11 +1345,17 @@ return RewardOutput(
 
 ## 五、Token级轨迹转换
 
+**代码位置**: `rllm/engine/agent_execution_engine.py:282-338` & `rllm/agents/utils.py:38-75`
+
 Agent交互生成的是对话形式，需要转换为token序列用于PPO训练。
 
 ### 5.1 对话到Token的转换
 
+**代码位置**: `rllm/agents/utils.py:38-75`
+
 ```python
+# 在 agent_execution_engine.py 中的 run_agent_trajectory_async 方法
+
 # 完整对话历史
 messages = [
     {"role": "system", "content": "You are a helpful AI assistant..."},
@@ -1188,18 +1368,35 @@ messages = [
 ]
 
 # 使用Qwen的chat template转换
-chat_parser = ChatTemplateParser.get_parser(tokenizer)
+# chat_parser 在 AgentExecutionEngine.__init__ 中初始化 (第91行)
 ```
 
 ### 5.2 Prompt Tokens (输入部分)
 
+**代码位置**: `rllm/engine/agent_execution_engine.py:203-209`
+
 ```python
-# 初始prompt（系统提示 + 用户问题）
-prompt_str = chat_parser.parse(
-    messages[:2],  # system + user
-    add_generation_prompt=True,
-    is_first_msg=True
+# 第203-204行: 初始prompt的token化
+messages = agent.chat_completions
+prompt_tokens, _ = convert_messages_to_tokens_and_masks(
+    messages,
+    tokenizer=self.tokenizer, 
+    parser=self.chat_parser, 
+    contains_first_msg=True,  # 包含系统消息
+    contains_generation_msg=True  # 包含生成提示
 )
+# convert_messages_to_tokens_and_masks 定义在 rllm/agents/utils.py:38-75
+
+# 内部流程：
+# 1. 第57行: 使用chat_parser.parse转换消息
+#    prompt_str = parser.parse([msg], add_generation_prompt=..., is_first_msg=...)
+# 
+# 2. 第64行: tokenize
+#    msg_tokens = tokenizer.encode(msg_text, add_special_tokens=False)
+# 
+# 3. 第65-66行: 生成mask (assistant=1, 其他=0)
+#    mask_value = 1 if msg["role"] == "assistant" else 0
+#    msg_mask = [mask_value] * len(msg_tokens)
 
 # 实际格式（Qwen）：
 # <|im_start|>system
@@ -1212,35 +1409,69 @@ prompt_str = chat_parser.parse(
 # <|im_start|>assistant
 # 
 
-prompt_tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
+# 第205行: 获取prompt长度
+prompt_token_len = len(prompt_tokens)
 # prompt_tokens = [151644, 8948, 198, 2610, 525, ...] (长度约300-500)
 ```
 
 ### 5.3 Response Tokens (生成部分)
 
+**代码位置**: `rllm/engine/agent_execution_engine.py:282-338`
+
 每一步的assistant消息和tool消息都会被tokenize：
 
 ```python
+# 在每一步的循环中 (第211-342行)
+
 response_tokens = []
 response_masks = []
 
+# 第282-292行: 获取最近的assistant和environment消息
+chat_completions_messages = agent.chat_completions
+assistant_message, env_messages = get_recent_assistant_user_messages(chat_completions_messages)
+# get_recent_assistant_user_messages 定义在 rllm/agents/utils.py:6-35
+
+# 第288-292行: 转换为tokens
+assistant_msg_tokens, assistant_msg_masks = [], []
+env_msg_tokens, env_msg_masks = [], []
+if assistant_message:
+    # 第290行: 转换assistant消息
+    assistant_msg_tokens, assistant_msg_masks = convert_messages_to_tokens_and_masks(
+        [assistant_message], 
+        tokenizer=self.tokenizer, 
+        parser=self.chat_parser, 
+        contains_first_msg=False, 
+        contains_generation_msg=False
+    )
+if env_messages:
+    # 第292行: 转换environment消息（tool输出）
+    env_msg_tokens, env_msg_masks = convert_messages_to_tokens_and_masks(
+        env_messages, 
+        tokenizer=self.tokenizer, 
+        parser=self.chat_parser, 
+        contains_first_msg=False, 
+        contains_generation_msg=True
+    )
+
 # 第1步：assistant的tool_call
-assistant_msg_1 = {"role": "assistant", "content": "I need to search...<tool_call>..."}
-tokens_1, masks_1 = convert_messages_to_tokens_and_masks([assistant_msg_1], ...)
+# assistant_msg_1 = {"role": "assistant", "content": "I need to search...<tool_call>..."}
+# tokens_1, masks_1 会是：
 # tokens_1 = [40, 1184, 311, 2711, ...] (长度约50-100)
 # masks_1 = [1, 1, 1, ...]  # 全1，因为是模型生成的
 
-response_tokens.extend(tokens_1)
-response_masks.extend(masks_1)
+# 第321行: 添加assistant的tokens
+response_tokens.extend(assistant_msg_tokens)
+response_masks.extend(assistant_msg_masks)
 
 # 第1步：tool的返回
-tool_msg_1 = {"role": "tool", "content": "[Document 1]...", ...}
-tokens_env_1, masks_env_1 = convert_messages_to_tokens_and_masks([tool_msg_1], ...)
+# tool_msg_1 = {"role": "tool", "content": "[Document 1]...", ...}
+# tokens_env_1, masks_env_1 会是：
 # tokens_env_1 = [58, 24361, 352, 60, ...] (长度约100-300)
-# masks_env_1 = [0, 0, 0, ...]  # 全0，因为不是模型生成的
+# masks_env_1 = [0, 0, 0, ...]  # 全0，因为不是模型生成的（第65行的逻辑）
 
-response_tokens.extend(tokens_env_1)
-response_masks.extend(masks_env_1)
+# 第337行: 添加environment的tokens (在done=False时)
+response_tokens.extend(env_msg_tokens)
+response_masks.extend(env_msg_masks)
 
 # 第2步：重复上述过程
 # ...
@@ -1299,11 +1530,42 @@ token_level_scores[last_model_token_idx] = 1.0  # 假设答对了
 
 ## 六、PPO训练过程
 
+**主要代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:122-300`
+
 ### 6.1 数据批次准备
+
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:154-184`
 
 经过上述处理后，一个批次的数据结构：
 
 ```python
+# 第156-162行: 从dataloader加载批次
+for batch_dict in self.train_dataloader:
+    # 第157行: 转换为DataProto
+    batch: DataProto = DataProto.from_single_dict(batch_dict)
+    
+    # 第158行: 为每个样本添加唯一ID
+    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+    
+    # 第159-162行: 重复样本以支持多次采样
+    batch = batch.repeat(
+        repeat_times=self.config.actor_rollout_ref.rollout.n,  # n=8
+        interleave=True,  # 交错排列 [s1, s1, s1, ..., s2, s2, s2, ...]
+    )
+    # 现在 batch_size = 64 × 8 = 512
+
+# 第170行: 初始化环境和Agent
+self.init_envs_and_agents(batch)
+# init_envs_and_agents 定义在第87-120行
+
+# 第182行: 生成Agent轨迹
+final_gen_batch_output, generate_metrics = self.generate_agent_trajectory(timing_raw=timing_raw, meta_info=batch.meta_info)
+# generate_agent_trajectory 调用 agent_execution_engine 生成轨迹
+
+# 第183行: 合并批次数据
+batch = batch.union(final_gen_batch_output)
+
+# 合并后的batch结构：
 batch = DataProto(
     batch={
         # [512, max_length] - 批次中所有序列
@@ -1329,9 +1591,15 @@ batch = DataProto(
 
 ### 6.2 计算 Old Log Probabilities
 
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:215-217`
+
 ```python
-# 使用当前（训练前）的Actor模型计算log概率
-old_log_prob = actor_rollout_wg.compute_log_prob(batch)
+# 第215-217行: 使用当前（训练前）的Actor模型计算log概率
+if self.use_reference_policy:
+    old_log_prob = self.ref_policy_wg.compute_log_prob(batch)
+else:
+    old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+# compute_log_prob 在 verl/workers/fsdp_workers.py 或 verl/workers/megatron_workers.py 中实现
 
 # 模型前向传播
 logits = model(input_ids, attention_mask)
@@ -1352,9 +1620,15 @@ batch.batch["old_log_probs"] = old_log_probs
 
 ### 6.3 计算 Values (如果使用Critic)
 
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:187-190`
+
 ```python
-# 使用Critic网络估计状态价值
-values = critic_wg.compute_values(batch)
+# 第187-190行: 使用Critic网络估计状态价值
+if self.use_critic:
+    with marked_timer("values", timing_raw):
+        values = self.critic_wg.compute_values(batch)
+        batch = batch.union(values)
+# compute_values 在 verl/workers/fsdp_workers.py 或 verl/workers/roles.py 中实现
 
 # Critic模型前向传播
 value_logits = critic_model(input_ids, attention_mask)
@@ -1368,11 +1642,14 @@ batch.batch["values"] = values
 
 ### 6.4 Rejection Sampling（可选）
 
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:226-264`
+
 ```python
-# 根据奖励过滤样本
-uids = batch.non_tensor_batch["uid"]
-unique_uids = np.unique(uids)
-valid_mask = torch.ones(len(uids), dtype=torch.bool)
+# 第226-264行: 根据奖励过滤样本（如果启用）
+if self.config.algorithm.get("rejection_sampling", {}).get("enable", False):
+    uids = batch.non_tensor_batch["uid"]
+    unique_uids = np.unique(uids)
+    valid_mask = torch.ones(len(uids), dtype=torch.bool)
 
 for uid in unique_uids:
     uid_mask = uids == uid
@@ -1391,9 +1668,18 @@ batch = batch[valid_mask]
 
 ### 6.5 计算 Advantages
 
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:192-211` & `verl/trainer/ppo/ray_trainer.py:compute_advantage`
+
 ```python
-# 计算优势函数 A(s,a) = Q(s,a) - V(s)
-advantages = compute_advantage(
+# 第192-211行: 计算优势函数
+with marked_timer("adv", timing_raw):
+    # 如果使用奖励模型
+    if self.use_rm:
+        reward_tensor = self.rm_wg.compute_rm_score(batch)
+        batch = batch.union(reward_tensor)
+    
+    # 计算优势函数 A(s,a) = Q(s,a) - V(s)
+    advantages = compute_advantage(
     rewards=batch.batch["token_level_scores"],
     values=batch.batch["values"],
     response_mask=batch.batch["response_mask"],
@@ -1415,9 +1701,13 @@ batch.batch["advantages"] = advantages
 
 ### 6.6 PPO Actor更新
 
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:270-295` & `verl/trainer/ppo/core_algos.py`
+
 ```python
-# PPO算法核心：多个epoch更新Actor
-for ppo_epoch in range(num_ppo_epochs):  # 通常1-4个epoch
+# 第270-295行: PPO算法核心：多个epoch更新Actor
+# 第270行: 开始PPO训练循环
+with marked_timer("update", timing_raw):
+    for ppo_epoch in range(self.config.algorithm.ppo_mini_batch_size):  # 通常1-4个epoch
     # Mini-batch训练
     for mini_batch in split_batch(batch, mini_batch_size=32):
         # 1. 计算新的log概率
@@ -1681,7 +1971,102 @@ trainer.nnodes = 1
 
 ---
 
-## 十二、总结
+## 十二、关键代码位置快速参考
+
+### 12.1 训练入口和配置
+- **训练脚本**: `rllm/examples/search/train_search_agent.py`
+- **训练器**: `rllm/trainer/agent_trainer.py:68-90` (`AgentTrainer.train`)
+- **Ray任务运行器**: `rllm/trainer/verl/train_agent_ppo.py:54-213` (`TaskRunner.run`)
+- **PPO训练器**: `rllm/trainer/verl/agent_ppo_trainer.py:122-300` (`AgentPPOTrainer.fit_agent`)
+
+### 12.2 Agent和Environment核心组件
+- **ToolAgent**: `rllm/agents/tool_agent.py:17-167`
+  - `__init__`: 第23-61行
+  - `update_from_model`: 第102-151行（解析工具调用）
+  - `update_from_env`: 第86-100行（处理环境反馈）
+  - `reset`: 第153-156行
+- **ToolEnvironment**: `rllm/environments/tools/tool_env.py:12-151`
+  - `__init__`: 第17-47行
+  - `step`: 第55-109行（执行工具调用）
+  - `_execute_tool_calls`: 第111-142行（并发执行工具）
+
+### 12.3 Agent-Environment交互引擎
+- **AgentExecutionEngine**: `rllm/engine/agent_execution_engine.py:26-538`
+  - `run_agent_trajectory_async`: 第168-408行（单条轨迹异步执行）
+  - `get_model_response`: 第120-151行（调用模型生成）
+  - `trajectory_generator`: 第420-467行（批量并发生成）
+- **Token转换工具**: `rllm/agents/utils.py`
+  - `convert_messages_to_tokens_and_masks`: 第38-75行
+  - `get_recent_assistant_user_messages`: 第6-35行
+
+### 12.4 推理引擎
+- **VerlEngine**: `rllm/engine/rollout/verl_engine.py:9-90`
+  - `get_model_response`: 第42-83行（vLLM异步推理）
+  - Token编码: 第56-58行
+  - 异步生成: 第63行
+  - Token解码: 第70行
+
+### 12.5 奖励计算
+- **search_reward_fn**: `rllm/rewards/reward_fn.py:62-81`
+- **RewardSearchFn**: `rllm/rewards/search_reward.py:9-254`
+  - `__call__`: 第233-254行（主入口）
+  - `extract_answer_from_response`: 第58-183行（答案提取）
+  - `unbox`: 第69-85行（提取\\boxed{}内容）
+  - `normalize_answer`: 第13-29行（答案标准化）
+  - `exact_match_score`: 第54-56行（精确匹配）
+  - `f1_score`: 第31-52行（F1计算）
+  - `evaluate_answer`: 第185-231行（综合评估）
+
+### 12.6 PPO训练流程
+- **批次准备**: `agent_ppo_trainer.py:154-184`
+  - 加载批次: 第156-162行
+  - 初始化环境: 第170行
+  - 生成轨迹: 第182行
+- **计算训练量**: `agent_ppo_trainer.py:187-224`
+  - Values计算: 第187-190行
+  - Advantages计算: 第192-211行
+  - Old log probs: 第215-217行
+- **Rejection Sampling**: `agent_ppo_trainer.py:226-264`
+- **PPO更新**: `agent_ppo_trainer.py:270-295`
+
+### 12.7 工具相关
+- **MultiTool**: `rllm/tools/multi_tool.py`（工具管理器）
+- **ToolParser**: `rllm/parser/`（工具调用解析器）
+- **ChatTemplateParser**: `rllm/parser/`（对话模板解析）
+
+### 12.8 数据流动路径
+```
+train_search_agent.py (入口)
+    ↓
+AgentTrainer.train() (trainer/agent_trainer.py:68)
+    ↓
+TaskRunner.run() (trainer/verl/train_agent_ppo.py:62)
+    ↓
+AgentPPOTrainer.fit_agent() (trainer/verl/agent_ppo_trainer.py:122)
+    ↓
+AgentExecutionEngine.trajectory_generator() (engine/agent_execution_engine.py:420)
+    ↓ (并发512条轨迹)
+AgentExecutionEngine.run_agent_trajectory_async() (engine/agent_execution_engine.py:168)
+    ↓ (Agent-Env交互循环)
+    ├─ Agent.reset() (agents/tool_agent.py:153)
+    ├─ Environment.reset() (environments/tools/tool_env.py:49)
+    ├─ [循环 max_steps=20 次]
+    │   ├─ VerlEngine.get_model_response() (engine/rollout/verl_engine.py:42)
+    │   ├─ Agent.update_from_model() (agents/tool_agent.py:102)
+    │   ├─ Environment.step() (environments/tools/tool_env.py:55)
+    │   └─ Agent.update_from_env() (agents/tool_agent.py:86)
+    └─ RewardSearchFn.__call__() (rewards/search_reward.py:233)
+    ↓
+convert_messages_to_tokens_and_masks() (agents/utils.py:38)
+    ↓
+[返回 DataProto with tokens]
+    ↓
+compute_advantages() (verl/trainer/ppo/ray_trainer.py)
+    ↓
+Actor.update() & Critic.update() (verl/workers/)
+```
+
+## 十三、总结
 
 这个训练流程的核心是将**多步推理问题**转化为**序列生成问题**，通过PPO算法优化模型生成能够正确使用工具并得出正确答案的轨迹。
 
@@ -1690,6 +2075,7 @@ trainer.nnodes = 1
 2. **工具调用机制**: 模型学习何时调用工具、如何构造查询
 3. **稀疏奖励**: 只在最终答案处给奖励，鼓励模型完成完整推理链
 4. **Token级训练**: 将对话历史转换为token序列，利用标准的PPO算法
+5. **异步并发**: 512条轨迹异步并发生成，大幅提升训练效率
 
 这种方法可以扩展到其他需要多步推理和工具使用的任务，如代码生成、数学问题求解等。
 

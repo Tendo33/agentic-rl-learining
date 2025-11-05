@@ -1,8 +1,8 @@
 import hydra
-from examples.solver_judge.solver_judge_flow import SolverJudgeWorkflow
 from rllm.data.dataset import DatasetRegistry
 from rllm.rewards.countdown_reward import countdown_reward_fn
 from rllm.trainer.agent_trainer import AgentTrainer
+from rllm_solver_judge.solver_judge_flow import SolverJudgeWorkflow
 
 
 @hydra.main(
