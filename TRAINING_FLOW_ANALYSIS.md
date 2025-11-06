@@ -247,8 +247,32 @@ max_env_workers = 64  # 最多64个线程并发执行环境操作（工具调用
 现在让我们追踪**单条轨迹**的完整过程（从512条中选一条）：
 
 ```python
+# ========== 轨迹执行开始 ==========
+# 第168行: 定义异步轨迹执行函数
+async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
+    """执行单条Agent轨迹的完整流程"""
+    
+    # 第170-171行: 获取当前Agent和Environment实例
+    agent = self.agents[idx]  # 从512个Agent中获取第idx个
+    env = self.envs[idx]      # 从512个Environment中获取第idx个
+    
+    # 第174-185行: 初始化轨迹追踪变量
+    termination_reason = None    # 终止原因
+    prompt_token_len = 0         # prompt的token长度
+    prompt_tokens = []           # prompt的token列表
+    response_token_len = 0       # response的token长度
+    response_tokens = []         # response的token列表
+    response_masks = []          # response的mask列表
+    total_time = 0.0            # 总耗时
+    reward_time = None          # 奖励计算耗时
+    llm_time = 0.0              # LLM推理耗时
+    env_time = 0.0              # 环境执行耗时
+    reward = 0.0                # 累计奖励
+    episode_steps = []          # 每一步的prompt-response对
+
 # ========== 环境初始化 ==========
 # 在 AgentExecutionEngine.run_agent_trajectory_async 方法中
+# 环境已在 init_envs_and_agents (agent_ppo_trainer.py:170) 中创建
 env = ToolEnvironment(
     task={
         "id": 0,
@@ -844,14 +868,35 @@ agent.update_from_env(next_observation, reward=0, done=False, info=info)
 
 # agent.messages现在有6条：
 # [system, user, assistant1, tool1, assistant2, tool2]
+
+# ========== 中间状态快照 (第2步完成时) ==========
+# Agent状态：
+# - agent.messages: 6条消息 (system, user, assistant1, tool1, assistant2, tool2)
+# - agent._trajectory.steps: [Step1, Step2]
+# - agent.current_observation: {"tool_outputs": {...}}
+# 
+# Environment状态：
+# - env.step_count: 2
+# - env.task: 原始任务信息
+# 
+# Trajectory状态：
+# - trajectory.uid: "abc123..."
+# - trajectory.steps: [Step1, Step2]
+# - trajectory.reward: 0.0 (尚未计算)
+# 
+# Token状态：
+# - prompt_tokens: [151644, 8948, ...] (长度约400)
+# - response_tokens: [40, 1184, ..., 58, 24361, ...] (长度约200)
+# - response_masks: [1, 1, ..., 0, 0, ...] (长度约200)
 ```
 
 #### **第9步：模型生成最终答案**
 
 ```python
 # ========== 模型第3次调用 ==========
+# 第231行: 再次调用模型生成
 prompt_messages = agent.chat_completions  # 6条消息
-response = await rollout_engine.get_model_response(prompt_messages, ...)
+response = await self.get_model_response(prompt_messages, application_id, **kwargs)
 
 # 模型生成最终答案：
 response = """Perfect! Now I have all the information I need:
@@ -1699,64 +1744,417 @@ batch.batch["advantages"] = advantages
 # advantages.shape = [batch_size, max_length]
 ```
 
-### 6.6 PPO Actor更新
+### 6.6 PPO Actor更新（权重更新的核心）
 
-**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:270-295` & `verl/trainer/ppo/core_algos.py`
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:417-427` & `verl/workers/fsdp_workers.py:update_actor`
+
+这是最关键的部分！让我们详细看看权重是如何更新的：
 
 ```python
-# 第270-295行: PPO算法核心：多个epoch更新Actor
-# 第270行: 开始PPO训练循环
-with marked_timer("update", timing_raw):
-    for ppo_epoch in range(self.config.algorithm.ppo_mini_batch_size):  # 通常1-4个epoch
-    # Mini-batch训练
-    for mini_batch in split_batch(batch, mini_batch_size=32):
-        # 1. 计算新的log概率
-        new_log_probs = actor_model(mini_batch)
+# ========== 第417-427行: PPO训练的主循环 ==========
+
+# 第417-420行: 更新Critic（如果使用）
+if self.use_critic:
+    with marked_timer("update_critic", timing_raw):
+        critic_output = self.critic_wg.update_critic(batch)
+        # critic_wg 是 RayWorkerGroup 实例
+        # update_critic 会在多个GPU上并行更新Critic网络
+        critic_metrics = reduce_metrics(critic_output)
+        metrics.update(critic_metrics)
+
+# 第425-427行: 更新Actor（核心）
+with marked_timer("update_actor", timing_raw):
+    actor_output = self.actor_rollout_wg.update_actor(batch)
+    # actor_rollout_wg 是 RayWorkerGroup 实例
+    # update_actor 是权重更新的关键方法
+    actor_metrics = reduce_metrics(actor_output)
+    metrics.update(actor_metrics)
+
+# ========== update_actor 内部流程 (verl/workers/fsdp_workers.py) ==========
+# 这个方法在每个GPU worker上执行
+
+def update_actor(self, data: DataProto):
+    """在Actor worker上执行PPO更新"""
+    
+    # 1. 提取批次数据
+    input_ids = data.batch["input_ids"]          # [batch_size, seq_len]
+    attention_mask = data.batch["attention_mask"] # [batch_size, seq_len]
+    responses = data.batch["responses"]           # [batch_size, response_len]
+    old_log_probs = data.batch["old_log_probs"]  # [batch_size, response_len]
+    advantages = data.batch["advantages"]         # [batch_size, response_len]
+    response_mask = data.batch["response_mask"]  # [batch_size, response_len]
+    
+    # 2. 分割成mini-batches（如果批次太大）
+    ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+    ppo_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size
+    num_minibatches = max(1, batch_size // ppo_mini_batch_size)
+    
+    # 3. 执行多个PPO epochs
+    all_metrics = []
+    for epoch_idx in range(self.config.actor_rollout_ref.actor.ppo_epochs):  # 通常1-4个epoch
         
-        # 2. 计算重要性采样比率
-        ratio = torch.exp(new_log_probs - mini_batch["old_log_probs"])
-        # ratio.shape = [32, max_length]
+        # 打乱数据（可选）
+        if self.config.actor_rollout_ref.actor.shuffle_minibatch:
+            indices = torch.randperm(batch_size)
+        else:
+            indices = torch.arange(batch_size)
         
-        # 3. 计算裁剪目标
-        clip_ratio = 0.28  # 从配置中获取
-        advantages = mini_batch["advantages"]
-        
-        # 未裁剪的目标
-        surr1 = ratio * advantages
-        
-        # 裁剪后的目标
-        ratio_clipped = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
-        surr2 = ratio_clipped * advantages
-        
-        # PPO目标：取两者的最小值
-        policy_loss = -torch.min(surr1, surr2)
-        
-        # 4. 应用response_mask
-        response_mask = mini_batch["response_mask"]
-        policy_loss = policy_loss * response_mask
-        
-        # 5. 聚合loss
-        # loss_agg_mode = "seq-mean-token-sum"
-        # 先对每个序列的token求和，再对序列求平均
-        policy_loss = policy_loss.sum(dim=1).mean()
-        
-        # 6. 反向传播
-        optimizer.zero_grad()
-        policy_loss.backward()
-        optimizer.step()
+        # 遍历每个mini-batch
+        for mb_idx in range(num_minibatches):
+            # 4. 获取mini-batch索引
+            start_idx = mb_idx * ppo_mini_batch_size
+            end_idx = min((mb_idx + 1) * ppo_mini_batch_size, batch_size)
+            mb_indices = indices[start_idx:end_idx]
+            
+            # 5. 提取mini-batch数据
+            mb_input_ids = input_ids[mb_indices]
+            mb_attention_mask = attention_mask[mb_indices]
+            mb_responses = responses[mb_indices]
+            mb_old_log_probs = old_log_probs[mb_indices]
+            mb_advantages = advantages[mb_indices]
+            mb_response_mask = response_mask[mb_indices]
+            
+            # ========== 6. 前向传播：计算新的log概率 ==========
+            # 这是关键！使用当前（可能已更新的）模型参数
+            with torch.enable_grad():  # 确保梯度计算开启
+                # 调用Actor模型
+                logits = self.actor_model(
+                    input_ids=mb_input_ids,
+                    attention_mask=mb_attention_mask
+                )  # [mb_size, seq_len, vocab_size]
+                
+                # 计算log概率
+                log_probs_all = F.log_softmax(logits, dim=-1)
+                # 提取response部分的log概率
+                response_len = mb_responses.shape[1]
+                response_logits = logits[:, -response_len:, :]  # [mb_size, response_len, vocab_size]
+                
+                # 收集实际生成的token的log概率
+                new_log_probs = torch.gather(
+                    log_probs_all[:, -response_len:, :],
+                    dim=2,
+                    index=mb_responses.unsqueeze(-1)
+                ).squeeze(-1)  # [mb_size, response_len]
+            
+            # ========== 7. 计算PPO损失 ==========
+            # 7.1 计算重要性采样比率
+            ratio = torch.exp(new_log_probs - mb_old_log_probs)  # [mb_size, response_len]
+            
+            # 7.2 计算未裁剪的目标
+            surr1 = ratio * mb_advantages
+            
+            # 7.3 计算裁剪后的目标
+            clip_range = self.config.actor_rollout_ref.actor.clip_range  # 通常0.2或0.28
+            ratio_clipped = torch.clamp(
+                ratio,
+                1.0 - clip_range,
+                1.0 + clip_range
+            )
+            surr2 = ratio_clipped * mb_advantages
+            
+            # 7.4 取两者最小值（PPO的核心）
+            policy_loss = -torch.min(surr1, surr2)  # [mb_size, response_len]
+            
+            # 7.5 应用response_mask（只对模型生成的token计算loss）
+            policy_loss = policy_loss * mb_response_mask
+            
+            # 7.6 聚合损失
+            # loss_agg_mode 通常是 "seq-mean-token-sum"
+            # 先对每个序列的token求和，再对序列求平均
+            policy_loss = policy_loss.sum(dim=1).mean()  # scalar
+            
+            # 7.7 添加熵正则化（可选，鼓励探索）
+            if self.config.actor_rollout_ref.actor.entropy_coeff > 0:
+                # 计算熵
+                probs = F.softmax(response_logits, dim=-1)
+                log_probs = F.log_softmax(response_logits, dim=-1)
+                entropy = -(probs * log_probs).sum(dim=-1)  # [mb_size, response_len]
+                entropy = (entropy * mb_response_mask).sum(dim=1).mean()
+                
+                # 添加到损失（负号因为我们要最大化熵）
+                policy_loss = policy_loss - self.config.actor_rollout_ref.actor.entropy_coeff * entropy
+            
+            # ========== 8. 反向传播和权重更新 ==========
+            # 8.1 清空梯度
+            self.optimizer.zero_grad()
+            
+            # 8.2 计算梯度
+            policy_loss.backward()
+            # 此时所有参数的.grad属性被填充
+            
+            # 8.3 梯度裁剪（防止梯度爆炸）
+            if self.config.actor_rollout_ref.actor.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.actor_model.parameters(),
+                    self.config.actor_rollout_ref.actor.max_grad_norm
+                )
+            
+            # 8.4 更新权重（这是真正改变模型参数的地方！）
+            self.optimizer.step()
+            # optimizer.step() 内部执行：
+            # for param in model.parameters():
+            #     param.data = param.data - learning_rate * param.grad
+            
+            # 8.5 更新学习率（如果使用scheduler）
+            if self.scheduler is not None:
+                self.scheduler.step()
+            
+            # ========== 9. 记录指标 ==========
+            with torch.no_grad():
+                # 计算KL散度（衡量策略变化）
+                kl = (mb_old_log_probs - new_log_probs).mean()
+                
+                # 计算裁剪比例（衡量有多少比率被裁剪了）
+                clip_frac = ((ratio < 1 - clip_range) | (ratio > 1 + clip_range)).float().mean()
+                
+                # 记录指标
+                mb_metrics = {
+                    "actor/policy_loss": policy_loss.item(),
+                    "actor/approx_kl": kl.item(),
+                    "actor/clip_frac": clip_frac.item(),
+                    "actor/ratio_mean": ratio.mean().item(),
+                    "actor/ratio_std": ratio.std().item(),
+                    "actor/advantages_mean": mb_advantages.mean().item(),
+                    "actor/advantages_std": mb_advantages.std().item(),
+                }
+                all_metrics.append(mb_metrics)
+    
+    # ========== 10. 聚合所有mini-batch和epoch的指标 ==========
+    final_metrics = {}
+    for key in all_metrics[0].keys():
+        final_metrics[key] = np.mean([m[key] for m in all_metrics])
+    
+    return DataProto.from_dict({"metrics": final_metrics})
+
+# ========== 权重更新后的状态变化 ==========
+# 
+# 更新前模型状态（以某一层为例）:
+# - actor_model.transformer.h[0].attn.q_proj.weight[0, :5]:
+#   tensor([0.0234, -0.0156, 0.0089, -0.0123, 0.0201])
+# 
+# 执行 optimizer.step() 后：
+# - actor_model.transformer.h[0].attn.q_proj.weight[0, :5]:
+#   tensor([0.0235, -0.0155, 0.0088, -0.0124, 0.0202])
+#   # 注意：参数发生了微小变化（通常在1e-4到1e-6量级）
+# 
+# 这些微小的变化累积起来，使得模型逐渐学会：
+# 1. 更准确地判断何时需要调用工具
+# 2. 更好地构造搜索查询
+# 3. 更有效地综合搜索结果
+# 4. 更准确地生成最终答案
 ```
 
-### 6.7 Critic更新（如果使用）
+### 6.7 完整批次状态跟踪（从生成到更新）
+
+让我们跟踪一个完整批次的状态变化：
 
 ```python
+# ========== 时刻T0: 批次开始 ==========
+# 配置：
+# - train_batch_size = 64（64个不同问题）
+# - rollout.n = 8（每个问题采样8次）
+# - total_trajectories = 512
+
+# ========== 时刻T1: 数据加载 ==========
+# agent_ppo_trainer.py:156-162
+batch_dict = next(train_dataloader)
+# batch_dict = {
+#     "prompt": [[{"role": "user", "content": "placeholder"}], ...],  # 64个
+#     "extra_info": [{"question": "...", "answer": "...", ...}, ...]  # 64个
+# }
+batch = DataProto.from_single_dict(batch_dict)
+batch.non_tensor_batch["uid"] = [uuid1, uuid2, ..., uuid64]
+batch = batch.repeat(repeat_times=8, interleave=True)
+# 现在 batch_size = 512
+# batch.non_tensor_batch["uid"] = [uuid1, uuid1, uuid1, ..., uuid64, uuid64, uuid64]
+
+# ========== 时刻T2: 环境和Agent创建 ==========
+# agent_ppo_trainer.py:170
+self.init_envs_and_agents(batch)
+# 创建了 512 个 (Agent, Environment) 对
+
+# ========== 时刻T3: 轨迹生成开始 ==========
+# agent_ppo_trainer.py:182
+final_gen_batch_output, generate_metrics = self.generate_agent_trajectory(...)
+# 内部调用 agent_execution_engine.trajectory_generator()
+# 512个轨迹并发执行，每个轨迹最多20步
+
+# ========== 时刻T4: 第一条轨迹完成 ==========
+# 耗时：约5-10秒（取决于步数和检索速度）
+trajectory_001 = {
+    "prompt_tokens": [151644, 8948, ...],     # 长度: 400
+    "response_tokens": [40, 1184, ...],        # 长度: 600
+    "response_masks": [1, 1, ..., 0, 0, ...],  # 长度: 600
+    "trajectory_reward": 1.0,                   # 答对了
+    "idx": 0,
+    "metrics": {
+        "steps": 3,
+        "total_time": 7.2,
+        "llm_time": 4.5,
+        "env_time": 2.7
+    }
+}
+
+# ========== 时刻T5: 所有512条轨迹完成 ==========
+# 耗时：约10-20秒（因为是并发的）
+# 生成的数据：
+all_trajectories = [trajectory_001, trajectory_002, ..., trajectory_512]
+
+# 转换为batch格式：
+batch = DataProto(
+    batch={
+        "input_ids": torch.tensor([...]),      # [512, 1200] (400+600+padding)
+        "attention_mask": torch.tensor([...]), # [512, 1200]
+        "response_mask": torch.tensor([...]),  # [512, 1200]
+        "responses": torch.tensor([...]),      # [512, 600]
+        "token_level_scores": torch.tensor([...]),  # [512, 1200]
+    },
+    non_tensor_batch={
+        "uid": [uuid1, uuid1, ..., uuid64, uuid64],  # 512个
+        "extra_info": [...],  # 512个
+    }
+)
+
+# 统计：
+# - 总轨迹数: 512
+# - 答对的轨迹数: 230 (45%)
+# - 答错的轨迹数: 282 (55%)
+# - 平均步数: 4.5
+# - 平均奖励: 0.45
+
+# ========== 时刻T6: 计算Values ==========
+# agent_ppo_trainer.py:187-190 (耗时: 约2-3秒)
+values = self.critic_wg.compute_values(batch)
+batch.batch["values"] = values  # [512, 1200]
+
+# ========== 时刻T7: Rejection Sampling ==========
+# agent_ppo_trainer.py:226-264
+# 分析每个uid的奖励分布：
+uid_analysis = {
+    uuid1: {
+        "trajectories": 8,
+        "rewards": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        "status": "solve_all",  # 全部答对，过滤掉
+        "keep": False
+    },
+    uuid2: {
+        "trajectories": 8,
+        "rewards": [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        "status": "solve_partial",  # 部分答对，保留
+        "keep": True
+    },
+    uuid3: {
+        "trajectories": 8,
+        "rewards": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "status": "solve_none",  # 全部答错，过滤掉
+        "keep": False
+    },
+    # ...
+}
+
+# Rejection Sampling结果：
+# - solve_all: 15个uid (15×8=120条轨迹) -> 过滤
+# - solve_none: 25个uid (25×8=200条轨迹) -> 过滤
+# - solve_partial: 24个uid (24×8=192条轨迹) -> 保留
+
+# 过滤后batch_size: 192
+batch = batch[valid_mask]
+
+# ========== 时刻T8: 计算Old Log Probs ==========
+# agent_ppo_trainer.py:305-319 (耗时: 约2-3秒)
+old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+batch.batch["old_log_probs"] = old_log_prob.batch["old_log_probs"]  # [192, 1200]
+
+# ========== 时刻T9: 计算Advantages ==========
+# agent_ppo_trainer.py:385-393 (耗时: <1秒)
+batch = compute_advantage(
+    batch,
+    gamma=0.99,
+    lam=0.95,
+    num_repeat=8
+)
+batch.batch["advantages"] = ...  # [192, 1200]
+
+# ========== 时刻T10: Actor更新开始 ==========
+# agent_ppo_trainer.py:425-427
+# 批次分割：
+# - batch_size = 192
+# - ppo_mini_batch_size = 32
+# - num_minibatches = 192 // 32 = 6
+# - ppo_epochs = 2
+# 
+# 总共会执行: 6 minibatches × 2 epochs = 12 次梯度更新
+
+# 更新过程（每个minibatch）：
+for epoch in range(2):
+    for mb_idx in range(6):
+        # 提取minibatch (32条轨迹)
+        mb_batch = batch[mb_idx*32:(mb_idx+1)*32]
+        
+        # 前向传播
+        new_log_probs = actor_model(mb_batch)  # 耗时: 约0.5秒
+        
+        # 计算loss
+        policy_loss = compute_ppo_loss(new_log_probs, mb_batch)
+        
+        # 反向传播
+        optimizer.zero_grad()
+        policy_loss.backward()  # 耗时: 约0.5秒
+        optimizer.step()        # 耗时: 约0.1秒
+        
+        # 模型参数已更新！
+
+# Actor更新总耗时: 约12-15秒
+
+# ========== 时刻T11: 批次完成 ==========
+# 记录指标
+metrics = {
+    "batch/solve_none": 25,
+    "batch/solve_all": 15,
+    "batch/solve_partial": 24,
+    "critic/full-score/mean": 0.45,
+    "actor/policy_loss": 0.23,
+    "actor/approx_kl": 0.012,
+    "actor/entropy": 2.34,
+    "trajectory/avg_steps": 4.5,
+    "timing/generation_time": 15.2,
+    "timing/training_time": 18.5,
+}
+
+# 保存checkpoint（每200步）
+if global_steps % 200 == 0:
+    save_checkpoint(model, optimizer, global_steps)
+
+# ========== 时刻T12: 下一个批次开始 ==========
+# global_steps += 1
+# 重复上述过程...
+```
+
+### 6.8 Critic更新（如果使用）
+
+**代码位置**: `rllm/trainer/verl/agent_ppo_trainer.py:417-420` & `verl/workers/fsdp_workers.py:update_critic`
+
+```python
+# 第417-420行: Critic更新（在Actor更新之前）
+if self.use_critic:
+    with marked_timer("update_critic", timing_raw):
+        critic_output = self.critic_wg.update_critic(batch)
+        critic_metrics = reduce_metrics(critic_output)
+        metrics.update(critic_metrics)
+
+# update_critic 内部流程（类似update_actor）
 for ppo_epoch in range(num_ppo_epochs):
     for mini_batch in split_batch(batch, mini_batch_size=32):
         # 1. 计算新的value估计
         new_values = critic_model(mini_batch)
         
         # 2. 计算value目标（return）
-        # return = reward + γV(s_{t+1})
-        returns = mini_batch["token_level_scores"] + gamma * new_values[:, 1:]
+        # 使用TD(λ)或MC return
+        returns = compute_returns(
+            rewards=mini_batch["token_level_scores"],
+            values=new_values,
+            gamma=0.99
+        )
         
         # 3. Value loss (MSE)
         value_loss = (new_values - returns) ** 2
@@ -1766,6 +2164,11 @@ for ppo_epoch in range(num_ppo_epochs):
         # 4. 反向传播
         critic_optimizer.zero_grad()
         value_loss.backward()
+        
+        # 5. 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(critic_model.parameters(), max_grad_norm)
+        
+        # 6. 更新权重
         critic_optimizer.step()
 ```
 
@@ -2066,16 +2469,136 @@ compute_advantages() (verl/trainer/ppo/ray_trainer.py)
 Actor.update() & Critic.update() (verl/workers/)
 ```
 
-## 十三、总结
+## 十三、总结与关键洞察
+
+### 13.1 训练流程核心
 
 这个训练流程的核心是将**多步推理问题**转化为**序列生成问题**，通过PPO算法优化模型生成能够正确使用工具并得出正确答案的轨迹。
 
-关键创新点：
-1. **Agent-Environment范式**: 将推理过程建模为Agent与环境的交互
-2. **工具调用机制**: 模型学习何时调用工具、如何构造查询
-3. **稀疏奖励**: 只在最终答案处给奖励，鼓励模型完成完整推理链
-4. **Token级训练**: 将对话历史转换为token序列，利用标准的PPO算法
-5. **异步并发**: 512条轨迹异步并发生成，大幅提升训练效率
+### 13.2 关键创新点
 
-这种方法可以扩展到其他需要多步推理和工具使用的任务，如代码生成、数学问题求解等。
+1. **Agent-Environment范式**: 将推理过程建模为Agent与环境的交互
+   - Agent: 负责生成思考和工具调用
+   - Environment: 负责执行工具并返回结果
+   - 清晰的职责分离，易于扩展
+
+2. **工具调用机制**: 模型学习何时调用工具、如何构造查询
+   - 使用结构化的工具调用格式（JSON）
+   - 支持多种工具（检索、计算、API调用等）
+   - 并发执行工具调用，提升效率
+
+3. **稀疏奖励**: 只在最终答案处给奖励，鼓励模型完成完整推理链
+   - 中间步骤reward=0，只在finish时计算奖励
+   - 使用EM和F1评估答案质量
+   - 奖励分配到最后一个模型生成的token
+
+4. **Token级训练**: 将对话历史转换为token序列，利用标准的PPO算法
+   - response_mask区分模型生成和环境返回的token
+   - 只对模型生成的token计算loss
+   - 支持任意长度的多步推理
+
+5. **异步并发**: 512条轨迹异步并发生成，大幅提升训练效率
+   - 使用asyncio实现高并发
+   - vLLM动态批处理多个请求
+   - 工具调用通过线程池并发
+
+6. **Rejection Sampling**: 智能过滤训练样本
+   - 过滤全对或全错的样本组（信息量低）
+   - 保留部分对部分错的样本（信息量高）
+   - 提升训练效率和模型性能
+
+### 13.3 权重更新机制详解
+
+PPO算法通过以下步骤更新模型权重：
+
+1. **采样**: 使用当前策略生成512条轨迹
+2. **评估**: 计算每条轨迹的奖励
+3. **优势计算**: 使用GAE计算每个token的优势函数
+4. **策略更新**: 
+   - 计算重要性采样比率 `ratio = exp(new_log_prob - old_log_prob)`
+   - 使用裁剪防止过大的策略更新
+   - 最小化 `-min(ratio * A, clip(ratio) * A)`
+5. **梯度下降**: 
+   - `optimizer.zero_grad()` 清空梯度
+   - `loss.backward()` 计算梯度
+   - `optimizer.step()` 更新参数
+6. **迭代**: 重复多个epoch和mini-batch
+
+### 13.4 时间和资源消耗
+
+一个完整批次（64问题×8采样=512轨迹）的时间分配：
+
+- **轨迹生成**: 10-20秒（并发）
+  - LLM推理: 4-8秒
+  - 工具执行: 3-7秒
+  - 其他: 3-5秒
+- **Values计算**: 2-3秒
+- **Advantages计算**: <1秒
+- **Old log probs计算**: 2-3秒
+- **Actor更新**: 12-15秒（12次梯度更新）
+- **Critic更新**: 5-8秒（如果使用）
+
+**总耗时**: 约35-50秒/批次
+
+对于15个epoch，假设每个epoch有100个批次：
+- 总批次数: 1,500
+- 总耗时: 约15-21小时
+- 使用2个GPU（CUDA_VISIBLE_DEVICES=3,4）
+
+### 13.5 关键参数调优建议
+
+1. **批次大小（train_batch_size）**: 
+   - 较大批次（64-128）提供更稳定的梯度
+   - 较小批次（16-32）训练更快但可能不稳定
+
+2. **采样次数（rollout.n）**:
+   - 8-16次采样提供足够的多样性
+   - 过多采样增加计算成本
+
+3. **裁剪范围（clip_range）**:
+   - 0.2-0.3是常用值
+   - 较小值（0.1-0.2）更保守，训练更稳定
+   - 较大值（0.3-0.5）更激进，可能更快收敛
+
+4. **学习率**:
+   - Actor: 1e-6 到 1e-5
+   - Critic: 5e-6 到 5e-5
+   - 使用cosine或linear decay
+
+5. **最大步数（max_steps）**:
+   - 根据任务复杂度调整（10-30步）
+   - 过多步数增加计算成本
+   - 过少步数可能无法完成推理
+
+### 13.6 扩展性和应用
+
+这种方法可以扩展到其他需要多步推理和工具使用的任务：
+
+1. **代码生成**: 
+   - 工具: 代码执行、文档查询、测试运行
+   - 奖励: 测试通过率、代码质量
+
+2. **数学问题求解**:
+   - 工具: 符号计算、数值计算、公式查询
+   - 奖励: 答案正确性
+
+3. **科学研究辅助**:
+   - 工具: 文献检索、数据分析、实验设计
+   - 奖励: 研究质量评估
+
+4. **复杂决策任务**:
+   - 工具: 信息查询、模拟、专家咨询
+   - 奖励: 决策质量评估
+
+### 13.7 未来改进方向
+
+1. **自适应步数**: 根据任务难度动态调整max_steps
+2. **层次化工具**: 支持工具的嵌套调用
+3. **多模态输入**: 支持图像、表格等输入
+4. **在线学习**: 在部署过程中持续学习
+5. **元学习**: 快速适应新任务和新工具
+
+---
+
+**文档完成！** 现在您应该对RLLM的训练流程有了深入而全面的理解，包括每一步的代码位置、中间状态变化和权重更新机制。
 
