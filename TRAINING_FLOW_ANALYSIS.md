@@ -126,6 +126,8 @@ Remember to search thoroughly and provide your final answer clearly within the \
 
 ### 2.1 数据集格式
 
+**代码位置**: 数据加载在 `train_search_agent.py:15-16`，实际使用在 `agent_ppo_trainer.py:156`
+
 原始数据存储在 Parquet 文件中：
 ```python
 {
@@ -136,39 +138,156 @@ Remember to search thoroughly and provide your final answer clearly within the \
 }
 ```
 
-### 2.2 Verl 格式转换
+### 2.2 数据加载和格式
 
-数据会被转换为 Verl 训练框架所需的格式：
+**代码位置**: `agent_ppo_trainer.py:156-162`
+
+数据通过dataloader加载，格式如下：
 
 ```python
-{
-    "prompt": [{"role": "user", "content": "placeholder"}],
-    "reward_model": {
-        "style": "rule",
-        "ground_truth": None,
-    },
-    "extra_info": {
+# 第156行: 从dataloader迭代获取批次
+for batch_dict in self.train_dataloader:
+    # batch_dict 的格式（直接从parquet加载）:
+    {
+        "prompt": [[{"role": "user", "content": "placeholder"}], ...],  # 占位符，不实际使用
+        "extra_info": [
+            {
         "id": 0,
         "question": "Which magazine was started first Arthur's Magazine or First for Women?",
         "answer": "Arthur's Magazine",
         "data_source": "hotpotqa"
+            },
+            # ... 更多任务
+        ]
     }
-}
+    
+    # 第157行: 转换为DataProto格式
+    batch: DataProto = DataProto.from_single_dict(batch_dict)
+    # DataProto 是 verl 的数据结构，包含：
+    # - batch: 存储tensor数据的字典
+    # - non_tensor_batch: 存储非tensor数据的字典
 ```
 
-### 2.3 批次组织
+**注意**: 这里的 `prompt` 字段是占位符，实际的问题信息在 `extra_info` 中。真正的prompt会在Agent-Environment交互时动态生成。
+
+### 2.3 GPU显存和模型加载
+
+**代码位置**: `train_agent_ppo.py:84-110` (init_workers)
+
+在训练开始前，需要将模型加载到GPU显存：
+
+```python
+# ========== GPU和模型配置 ==========
+# 配置来自 train_search_agent.sh:
+# export CUDA_VISIBLE_DEVICES=3,4  # 使用GPU 3和4
+# 
+# Ray和FSDP配置:
+# - trainer.n_gpus_per_node = 2
+# - trainer.nnodes = 1
+# - actor_rollout_ref.actor.strategy = "fsdp"  # Fully Sharded Data Parallel
+
+# ========== 模型分布（2个GPU） ==========
+# 
+# **GPU 0 (物理GPU 3):**
+# 1. Actor模型（用于训练，FSDP分片）
+#    - 模型参数在多个GPU间分片存储
+#    - 只保存部分层的参数
+#    - 前向传播时通过all-gather收集完整参数
+#    - 反向传播时计算本地梯度
+#    
+# 2. Rollout引擎（vLLM，用于推理）
+#    - 异步LLM服务器
+#    - KV cache
+#    - 采样参数
+# 
+# **GPU 1 (物理GPU 4):**
+# 1. Actor模型（FSDP分片的另一部分）
+# 2. Rollout引擎
+# 
+# 注意：本配置使用RLOO优势估计，不使用Critic模型
+# (train_search_agent.sh:25 algorithm.adv_estimator=rloo)
+# (train_search_agent.sh:63 trainer.critic_warmup=0)
+#
+# ========== 显存占用估算（以Qwen3-4B为例，本配置实际模型） ==========
+# 
+# **Actor模型（训练时，带参数/优化器卸载）:**
+# - 模型参数: ~4B × 2bytes(fp16) = 8GB
+# - 优化器状态: ~4B × 8bytes(Adam) = 32GB (卸载到CPU)
+# - 梯度: ~4B × 2bytes = 8GB
+# - 激活值: ~2-4GB（取决于batch size）
+# 使用FSDP分片到2个GPU: (8+8+4)/2 ≈ 10GB/GPU
+# 配置了optimizer_offload和param_offload，进一步减少显存
+# (train_search_agent.sh:44-45)
+# 
+# **Rollout引擎（vLLM推理时）:**
+# - 模型参数: ~4B × 2bytes = 8GB
+# - KV cache: ~2-4GB
+# - gpu_memory_utilization=0.85 (第51行)
+# - 每个GPU: ~10-12GB
+# 
+# **总计每个GPU:**
+# - 训练阶段: ~20GB（峰值，使用offload）
+# - 推理阶段: ~12GB
+# 
+# 因此使用2×24GB GPU（如RTX 3090/4090）即可运行
+# 注意：不使用Critic模型，节省了额外的显存
+
+# ========== 模型初始化代码流程 ==========
+# train_agent_ppo.py:64-127
+
+# 1. 第84-86行: 加载模型到本地
+from verl.utils.fs import copy_to_local
+local_path = copy_to_local(
+    config.actor_rollout_ref.model.path, 
+    use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+)
+# 将模型从HDFS/云存储下载到本地
+
+# 2. 第89-93行: 初始化tokenizer
+from verl.utils import hf_tokenizer
+tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+
+# 3. 第97-116行: 定义Worker类
+if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+    from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+    actor_rollout_cls = AsyncActorRolloutRefWorker  # 因为 rollout.mode == "async"
+
+# 4. 第129-135行: 定义角色到Worker的映射
+role_worker_mapping = {
+    Role.ActorRollout: ray.remote(actor_rollout_cls),
+    Role.Critic: ray.remote(CriticWorker),
+}
+
+# 5. 实际初始化（在AgentPPOTrainer.init_workers中）
+# agent_ppo_trainer.py:64-85
+def init_workers(self):
+    super().init_workers()  # 初始化actor_rollout_wg和critic_wg
+    # 这里会在每个GPU上创建Ray worker，加载模型到显存
+    
+    # 创建Agent执行引擎（不占用显存，只是管理器）
+    self.agent_execution_engine = AsyncAgentExecutionEngine(...)
+
+# 模型加载完成后，显存状态：
+# GPU 0: Actor(FSDP分片) + vLLM服务器 ≈ 60GB
+# GPU 1: Actor(FSDP分片) + vLLM服务器 + Critic ≈ 65GB
+```
+
+### 2.4 批次组织
+
+**代码位置**: `agent_ppo_trainer.py:158-162`
 
 ```python
 # 训练批次大小 = 64
 # 每个问题采样 n=8 个回复
 # 实际处理的序列数 = 64 × 8 = 512 条轨迹
 
+# 第157行
 batch = DataProto.from_single_dict(batch_dict)
-# 添加唯一ID
-batch.non_tensor_batch["uid"] = [uuid.uuid4() for _ in range(64)]
-# 重复以支持多次采样
+# 第158行: 添加唯一ID
+batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(64)], dtype=object)
+# 第159-162行: 重复以支持多次采样
 batch = batch.repeat(repeat_times=8, interleave=True)
-```
+# 现在 batch_size = 512
 
 ---
 
@@ -591,9 +710,9 @@ self.step_count += 1  # 现在 = 1
 done = self.step_count >= self.max_steps or isinstance(action, str)
 if isinstance(action, list) and action:
     for tool_call in action:
-        if tool_call.get("function", {}).get("name") == "finish":
-            done = True
-            break
+    if tool_call.get("function", {}).get("name") == "finish":
+        done = True
+        break
 
 # 如果是finish，跳转到第82-101行计算奖励
 # 如果不是finish，继续执行工具
@@ -946,9 +1065,9 @@ self.step_count += 1  # 第70行: = 3
 done = self.step_count >= self.max_steps or isinstance(action, str)
 if isinstance(action, list) and action:
     for tool_call in action:
-        if tool_call.get("function", {}).get("name") == "finish":
-            done = True
-            break
+    if tool_call.get("function", {}).get("name") == "finish":
+        done = True
+        break
 
 # 第82-97行: 处理终止情况
 if done:
@@ -1692,9 +1811,9 @@ batch.batch["values"] = values
 ```python
 # 第226-264行: 根据奖励过滤样本（如果启用）
 if self.config.algorithm.get("rejection_sampling", {}).get("enable", False):
-    uids = batch.non_tensor_batch["uid"]
-    unique_uids = np.unique(uids)
-    valid_mask = torch.ones(len(uids), dtype=torch.bool)
+uids = batch.non_tensor_batch["uid"]
+unique_uids = np.unique(uids)
+valid_mask = torch.ones(len(uids), dtype=torch.bool)
 
 for uid in unique_uids:
     uid_mask = uids == uid
@@ -1723,8 +1842,8 @@ with marked_timer("adv", timing_raw):
         reward_tensor = self.rm_wg.compute_rm_score(batch)
         batch = batch.union(reward_tensor)
     
-    # 计算优势函数 A(s,a) = Q(s,a) - V(s)
-    advantages = compute_advantage(
+# 计算优势函数 A(s,a) = Q(s,a) - V(s)
+advantages = compute_advantage(
     rewards=batch.batch["token_level_scores"],
     values=batch.batch["values"],
     response_mask=batch.batch["response_mask"],
@@ -1860,7 +1979,7 @@ def update_actor(self, data: DataProto):
             
             # 7.6 聚合损失
             # loss_agg_mode 通常是 "seq-mean-token-sum"
-            # 先对每个序列的token求和，再对序列求平均
+        # 先对每个序列的token求和，再对序列求平均
             policy_loss = policy_loss.sum(dim=1).mean()  # scalar
             
             # 7.7 添加熵正则化（可选，鼓励探索）
@@ -1879,7 +1998,7 @@ def update_actor(self, data: DataProto):
             self.optimizer.zero_grad()
             
             # 8.2 计算梯度
-            policy_loss.backward()
+        policy_loss.backward()
             # 此时所有参数的.grad属性被填充
             
             # 8.3 梯度裁剪（防止梯度爆炸）
@@ -2227,59 +2346,404 @@ if global_step % 200 == 0:
 
 ---
 
-## 八、完整流程图
+## 八、完整流程图（超详细版）
 
 ```
-[数据加载] 
-   ↓
-[批次准备: 64个问题 × 8次采样 = 512条轨迹]
-   ↓
-┌─────────────────────────────────────────────┐
-│  Agent-Environment 交互 (每条轨迹独立)      │
-├─────────────────────────────────────────────┤
-│  Step 1: 模型生成工具调用                   │
-│    └→ 提示词 → Verl Rollout → Tool Call     │
-│  Step 2: 执行工具                           │
-│    └→ LocalRetrievalTool → 检索服务器       │
-│  Step 3: 模型处理工具结果                   │
-│    └→ 更新对话历史                          │
-│  ...                                        │
-│  Step N: 生成最终答案 (finish)               │
-│    └→ 计算奖励 (Reward Function)            │
-└─────────────────────────────────────────────┘
-   ↓
-[轨迹转换为Token序列]
-   ├→ prompt_tokens
-   ├→ response_tokens  
-   ├→ response_masks (1=模型生成, 0=环境返回)
-   └→ token_level_scores (奖励分配到最后一个token)
-   ↓
-[计算训练所需量]
-   ├→ old_log_probs (旧策略的log概率)
-   ├→ values (Critic估计)
-   └→ advantages (优势函数)
-   ↓
-[Rejection Sampling]
-   └→ 过滤全对/全错的样本组
-   ↓
-[PPO训练]
-   ├→ Actor更新 (多个mini-batch, 多个epoch)
-   │   └→ 最大化 min(r*A, clip(r)*A)
-   └→ Critic更新 (如果使用)
-       └→ 最小化 (V - Return)^2
-   ↓
-[保存检查点] (每200步)
-   ↓
-[验证] (每200步)
-   ↓
-[重复下一个批次]
+┌══════════════════════════════════════════════════════════════════════════════┐
+│                          RLLM 训练完整流程图                                  │
+└══════════════════════════════════════════════════════════════════════════════┘
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ 阶段0: 初始化（一次性）                                                    ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    │
+    ├─► [GPU初始化] (train_agent_ppo.py:84-127)
+    │   ├─► GPU 0: 加载Actor模型(FSDP分片) + vLLM服务器 → 显存: ~20GB
+    │   └─► GPU 1: 加载Actor模型(FSDP分片) + vLLM服务器 → 显存: ~20GB
+    │   注意：使用RLOO，无Critic模型，节省显存
+    │
+    ├─► [Ray Workers初始化] (verl框架)
+    │   └─► ActorRolloutRefWorker × 2 (每个GPU一个)
+    │       注意：使用RLOO，不创建CriticWorker
+    │
+    └─► [加载数据集] (train_search_agent.py:15-16)
+        └─► HotpotQA训练集 (parquet格式)
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ 阶段1: 批次准备 (每个批次开始)                                             ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    │
+    ├─► [数据加载] (agent_ppo_trainer.py:156)
+    │   └─► 从dataloader获取64个问题
+    │       格式: {"prompt": [...], "extra_info": [{"question": "...", "answer": "..."}]}
+    │
+    ├─► [转换为DataProto] (agent_ppo_trainer.py:157)
+    │   └─► DataProto.from_single_dict(batch_dict)
+    │
+    ├─► [添加UID] (agent_ppo_trainer.py:158)
+    │   └─► 为64个问题各生成一个UUID
+    │
+    ├─► [重复采样] (agent_ppo_trainer.py:159-162)
+    │   └─► batch.repeat(repeat_times=8, interleave=True)
+    │       64问题 × 8次采样 = 512条轨迹
+    │
+    └─► [创建Agent和Environment] (agent_ppo_trainer.py:170, 87-120)
+        ├─► 512个 ToolAgent 实例 (并发创建，使用线程池)
+        └─► 512个 ToolEnvironment 实例 (并发创建)
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ 阶段2: Agent-Environment交互 (512条轨迹并发执行，10-20秒)                  ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    │
+    ├─► [启动异步轨迹生成] (agent_ppo_trainer.py:182, 534-564)
+    │   └─► generate_agent_trajectory()
+    │       └─► generate_agent_trajectories_async() (agent_ppo_trainer.py:815-849)
+    │           └─► agent_execution_engine.trajectory_generator()
+    │               (agent_execution_engine.py:420-467)
+    │
+    ├─► [512条轨迹并发执行] (asyncio.gather)
+    │   │
+    │   ├─► 【单条轨迹详细流程】(agent_execution_engine.py:168-408)
+    │   │   │
+    │   │   ├─► [初始化] (第174-185行)
+    │   │   │   ├─► 变量初始化: prompt_tokens, response_tokens, total_time等
+    │   │   │   └─► 获取agent和env实例
+    │   │   │
+    │   │   ├─► [环境重置] (第191行)
+    │   │   │   └─► env.reset() → observation = {"question": "..."}
+    │   │   │       (environments/tools/tool_env.py:49-53)
+    │   │   │
+    │   │   ├─► [Agent重置] (第195行)
+    │   │   │   └─► agent.reset() → 清空messages和trajectory
+    │   │   │       (agents/tool_agent.py:153-156)
+    │   │   │
+    │   │   ├─► [Agent处理初始观察] (第196-202行)
+    │   │   │   └─► agent.update_from_env(observation, reward=0, done=False)
+    │   │   │       ├─► 格式化observation为user消息
+    │   │   │       └─► 添加到agent.messages
+    │   │   │           (agents/tool_agent.py:86-100)
+    │   │   │
+    │   │   ├─► [初始prompt token化] (第203-204行)
+    │   │   │   └─► convert_messages_to_tokens_and_masks(messages)
+    │   │   │       └─► prompt_tokens (长度约400)
+    │   │   │           (agents/utils.py:38-75)
+    │   │   │
+    │   │   └─► [推理循环] 最多20步 (第211-342行)
+    │   │       │
+    │   │       ├─► 【第i步循环内容】(i = 1 to 20 or until done)
+    │   │       │   │
+    │   │       │   ├─► Step A: [模型生成] (第231行, 耗时: ~0.5-1秒)
+    │   │       │   │   ├─► prompt_messages = agent.chat_completions
+    │   │       │   │   ├─► response = await get_model_response()
+    │   │       │   │   │   └─► VerlEngine.get_model_response()
+    │   │       │   │   │       (engine/rollout/verl_engine.py:42-83)
+    │   │       │   │   │       ├─► 第56行: tokenize prompt
+    │   │       │   │   │       ├─► 第63行: vLLM异步生成
+    │   │       │   │   │       │   └─► server_manager.generate()
+    │   │       │   │   │       │       └─► vLLM动态批处理 (GPU推理)
+    │   │       │   │   │       └─► 第70行: decode tokens
+    │   │       │   │   └─► 输出: response (包含<tool_call>或finish)
+    │   │       │   │
+    │   │       │   ├─► Step B: [解析工具调用] (第243行)
+    │   │       │   │   └─► action = agent.update_from_model(response)
+    │   │       │   │       (agents/tool_agent.py:102-151)
+    │   │       │   │       ├─► 第111行: 解析tool_calls
+    │   │       │   │       ├─► 第114行: 生成UUID
+    │   │       │   │       ├─► 第146行: 添加到messages
+    │   │       │   │       ├─► 第148行: 创建新Step
+    │   │       │   │       └─► 第151行: 返回Action
+    │   │       │   │
+    │   │       │   ├─► Step C: [执行工具] (第250行, 耗时: ~0.5-2秒)
+    │   │       │   │   └─► next_obs, reward, done, info = env.step(action)
+    │   │       │   │       (environments/tools/tool_env.py:55-109)
+    │   │       │   │       ├─► 第70行: step_count += 1
+    │   │       │   │       ├─► 第74-80行: 检查是否finish
+    │   │       │   │       │   ├─► 如果finish: 跳到奖励计算
+    │   │       │   │       │   └─► 否则: 继续执行工具
+    │   │       │   │       └─► 第105行: _execute_tool_calls()
+    │   │       │   │           (第111-142行，线程池并发)
+    │   │       │   │           ├─► LocalRetrievalTool.forward()
+    │   │       │   │           │   ├─► POST请求到检索服务器
+    │   │       │   │           │   │   (http://127.0.0.1:2727/retrieve)
+    │   │       │   │           │   ├─► 向量检索Wikipedia文档
+    │   │       │   │           │   └─► 返回top-k结果
+    │   │       │   │           └─► 格式化为ToolOutput
+    │   │       │   │
+    │   │       │   ├─► Step D: [Agent处理工具输出] (第268-274行)
+    │   │       │   │   └─► agent.update_from_env(next_obs, reward, done, info)
+    │   │       │   │       ├─► 格式化tool输出为tool消息
+    │   │       │   │       ├─► 添加到messages
+    │   │       │   │       └─► 更新上一步的reward和done
+    │   │       │   │
+    │   │       │   ├─► Step E: [token化此步] (第282-292行)
+    │   │       │   │   ├─► assistant_msg_tokens (mask=1)
+    │   │       │   │   └─► env_msg_tokens (mask=0)
+    │   │       │   │
+    │   │       │   └─► Step F: [追加到response_tokens] (第321, 337行)
+    │   │       │       ├─► response_tokens.extend(assistant_msg_tokens)
+    │   │       │       └─► response_tokens.extend(env_msg_tokens)
+    │   │       │
+    │   │       └─► [终止条件检查] (第325-342行)
+    │   │           ├─► 达到max_steps (20步)
+    │   │           ├─► done=True (调用finish)
+    │   │           ├─► 超时 (trajectory_timeout)
+    │   │           └─► token长度超限
+    │   │
+    │   └─► [轨迹完成] (第370-408行)
+    │       ├─► 如果finish: 计算奖励
+    │       │   └─► env.step(finish_action)
+    │       │       └─► reward_fn(task_info, llm_response)
+    │       │           (rewards/search_reward.py:233-254)
+    │       │           ├─► 提取答案 (第186行, unbox)
+    │       │           ├─► 标准化 (第13-29行)
+    │       │           ├─► 计算EM (第54-56行)
+    │       │           ├─► 计算F1 (第31-52行)
+    │       │           └─► 赋予奖励 (第241-250行)
+    │       │
+    │       ├─► 聚合trajectory统计 (第372-373行)
+    │       └─► 返回token结果 (第378-398行)
+    │           返回: {
+    │               "prompt_tokens": tensor(...),
+    │               "response_tokens": tensor(...),
+    │               "response_masks": tensor(...),
+    │               "trajectory_reward": float,
+    │               "idx": int,
+    │               "metrics": {...}
+    │           }
+    │
+    └─► [收集所有轨迹] (agent_ppo_trainer.py:553-559)
+        └─► 512条轨迹收集完成
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ 阶段3: 轨迹转换为训练数据 (agent_ppo_trainer.py:591-709, 耗时: <1秒)      ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    │
+    └─► [_transform_agent_trajectories] (第591-709行)
+        ├─► 第612-621行: 提取tokens和masks
+        ├─► 第649-655行: 左填充prompts到max_prompt_length
+        ├─► 第659-665行: 右填充responses到max_response_length
+        ├─► 第668行: 拼接input_ids = [prompts, responses]
+        ├─► 第679行: 生成attention_mask
+        ├─► 第682-684行: 生成response_mask (loss mask)
+        ├─► 第689-695行: 分配奖励到最后一个response token
+        └─► 第697-705行: 组装DataProto
+            返回: DataProto包含:
+                "input_ids": [512, max_len]
+                "attention_mask": [512, max_len]
+                "response_mask": [512, response_len]
+                "responses": [512, response_len]
+                "token_level_scores": [512, response_len]
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ 阶段4: 准备PPO训练数据 (agent_ppo_trainer.py:187-393, 耗时: 5-10秒)       ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    │
+    ├─► [准备优势估计] (第187-190行)
+    │   └─► 本配置使用RLOO，不需要计算Values
+    │       (algorithm.adv_estimator=rloo，无需Critic模型)
+    │
+    ├─► [Rejection Sampling] (第226-264行)
+    │   ├─► 分析每个uid的奖励分布
+    │   │   ├─► solve_all: 全部答对 → 过滤
+    │   │   ├─► solve_none: 全部答错 → 过滤
+    │   │   └─► solve_partial: 部分对 → 保留
+    │   └─► batch = batch[valid_mask]  # 从512降到~192
+    │
+    ├─► [计算Old Log Probs] (第305-319行, 耗时: 2-3秒)
+    │   └─► old_log_prob = actor_rollout_wg.compute_log_prob(batch)
+    │       └─► 在GPU上执行模型前向传播
+    │           └─► batch.batch["old_log_probs"] = ...  # [192, max_len]
+    │
+    └─► [计算Advantages - RLOO方法] (第385-393行, 耗时: <1秒)
+        └─► batch = compute_advantage_rloo(
+                batch,
+                num_repeat=8  # 每个问题8个采样
+            )
+            # RLOO算法: advantage[i] = reward[i] - mean(reward[j!=i])
+            # 对于同一问题的8个采样，每个样本的优势 = 自己的奖励 - 其他7个的平均
+            └─► batch.batch["advantages"] = ...  # [192, max_len]
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ 阶段5: PPO训练 (agent_ppo_trainer.py:417-427, 耗时: 12-15秒)              ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    │
+    └─► [更新Actor] (第425-427行, 耗时: 12-15秒) ★★★核心★★★
+        注意：使用RLOO，跳过Critic更新
+        └─► actor_output = actor_rollout_wg.update_actor(batch)
+            └─► 在每个GPU Worker上执行:
+                │
+                ├─► 批次分割:
+                │   batch_size = 192
+                │   ppo_mini_batch_size = 32
+                │   num_minibatches = 192 // 32 = 6
+                │   ppo_epochs = 2
+                │   总共: 6 × 2 = 12次梯度更新
+                │
+                └─► 【每次梯度更新的详细流程】
+                    │
+                    ├─► [1. 前向传播] (耗时: ~0.5秒)
+                    │   ├─► logits = actor_model(input_ids, attention_mask)
+                    │   │   └─► FSDP all-gather收集完整参数
+                    │   │       └─► Transformer前向传播
+                    │   └─► new_log_probs = gather(logits, responses)
+                    │
+                    ├─► [2. 计算PPO Loss]
+                    │   ├─► ratio = exp(new_log_probs - old_log_probs)
+                    │   ├─► surr1 = ratio * advantages
+                    │   ├─► surr2 = clip(ratio, 1-ε, 1+ε) * advantages
+                    │   ├─► policy_loss = -min(surr1, surr2)
+                    │   └─► policy_loss = (policy_loss * response_mask).sum(dim=1).mean()
+                    │
+                    ├─► [3. 反向传播] (耗时: ~0.5秒)
+                    │   ├─► optimizer.zero_grad()
+                    │   ├─► policy_loss.backward()
+                    │   │   └─► 计算所有参数的梯度
+                    │   │       └─► param.grad 被填充
+                    │   └─► clip_grad_norm_(parameters, max_grad_norm)
+                    │
+                    ├─► [4. 权重更新] (耗时: ~0.1秒) ★★★
+                    │   └─► optimizer.step()
+                    │       └─► for param in parameters:
+                    │               param.data -= lr * param.grad
+                    │           ★ 模型参数被更新！
+                    │
+                    └─► [5. 记录指标]
+                        ├─► policy_loss
+                        ├─► approx_kl
+                        ├─► clip_frac
+                        └─► entropy
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ 阶段6: 后处理和日志 (agent_ppo_trainer.py:428-456, 耗时: <1秒)            ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    │
+    ├─► [聚合指标] (第428-430行)
+    │   └─► metrics = reduce_metrics([actor_metrics, critic_metrics])
+    │
+    ├─► [记录到日志] (第431-437行)
+    │   └─► logger.log(metrics, step=global_steps)
+    │       └─► wandb/tensorboard
+    │
+    ├─► [保存检查点] (每200步)
+    │   └─► if global_steps % 200 == 0:
+    │           save_checkpoint(model, optimizer, global_steps)
+    │
+    ├─► [验证] (每200步, agent_ppo_trainer.py:451-454)
+    │   └─► if global_steps % 200 == 0:
+    │           val_metrics = _validate_agent()  # (第457-532行)
+    │           └─► 在验证集上运行Agent
+    │               └─► 计算准确率、pass@k等指标
+    │
+    └─► [global_steps += 1] → 继续下一个批次
+
+═══════════════════════════════════════════════════════════════════════════
+总结：完整批次时间线（RLOO配置）
+═══════════════════════════════════════════════════════════════════════════
+T0: 批次加载 (<0.1秒)
+T1: 创建Agent/Env (1-2秒)
+T2: 轨迹生成 (10-20秒) ← 最耗时
+T3: 轨迹转换 (<1秒)
+T4: Rejection Sampling (<0.1秒)
+T5: 计算Old Log Probs (2-3秒)
+T6: 计算RLOO Advantages (<1秒)
+T7: 更新Actor (12-15秒) ← 第二耗时
+T8: 后处理 (<1秒)
+───────────────────────────────────────────
+总计: 27-42秒/批次
+注意：使用RLOO优势估计，无Critic模型，比标准PPO快5-8秒
 ```
 
 ---
 
 ## 九、关键技术细节
 
-### 9.1 异步生成
+### 9.1 RLOO优势估计（本配置使用）
+
+**代码位置**: `train_search_agent.sh:25` `algorithm.adv_estimator=rloo`
+
+#### 9.1.1 什么是RLOO？
+
+**RLOO (REINFORCE Leave-One-Out)** 是一种无需Critic模型的优势估计方法。
+
+**核心思想**：
+- 对于同一个问题，采样n个不同的回复（本配置n=8）
+- 每个回复的优势 = 自己的奖励 - 其他(n-1)个回复的平均奖励
+
+**数学公式**：
+```
+对于问题q的第i个采样：
+A_i = R_i - (1/(n-1)) * Σ_{j≠i} R_j
+
+其中：
+- R_i: 第i个回复的奖励
+- n: 采样数量（本配置为8）
+- A_i: 第i个回复的优势
+```
+
+#### 9.1.2 RLOO vs 标准PPO（带Critic）
+
+| 维度 | RLOO | 标准PPO (带Critic) |
+|------|------|-------------------|
+| **需要Critic模型** | ❌ 不需要 | ✅ 需要 |
+| **显存占用** | 低（仅Actor） | 高（Actor+Critic） |
+| **训练速度** | 快（27-42秒/批次） | 慢（35-50秒/批次） |
+| **优势估计方式** | 同一问题的其他采样 | Critic网络估计值函数 |
+| **采样需求** | 每问题需多次采样(n≥2) | 可以单次采样 |
+| **方差** | 中等 | 低（Critic平滑估计） |
+| **偏差** | 低 | 中等（Critic估计误差） |
+
+#### 9.1.3 RLOO实际案例
+
+假设对问题"Who won the 2020 election?"采样8次，得到奖励：
+
+```python
+# 8个采样的奖励（1=正确，0=错误）
+rewards = [1, 0, 1, 0, 1, 0, 0, 1]  # 5个正确，3个错误
+
+# 计算每个采样的优势
+for i in range(8):
+    # 计算其他7个采样的平均奖励
+    baseline = sum(rewards[j] for j in range(8) if j != i) / 7
+    advantage[i] = rewards[i] - baseline
+    
+# 结果：
+advantages = [
+    1 - 3/7 = +0.57,  # 正确回复，优势为正
+    0 - 4/7 = -0.57,  # 错误回复，优势为负
+    1 - 3/7 = +0.57,  # 正确回复，优势为正
+    0 - 4/7 = -0.57,  # 错误回复，优势为负
+    1 - 3/7 = +0.57,  # 正确回复，优势为正
+    0 - 4/7 = -0.57,  # 错误回复，优势为负
+    0 - 4/7 = -0.57,  # 错误回复，优势为负
+    1 - 3/7 = +0.57,  # 正确回复，优势为正
+]
+
+# PPO训练时：
+# - 正确回复（优势>0）的概率会被增强
+# - 错误回复（优势<0）的概率会被抑制
+```
+
+#### 9.1.4 为什么RLOO有效？
+
+1. **自适应基线**：对于简单问题（大家都能答对），基线高，单个正确回复的优势小
+2. **区分度好**：对于困难问题（大家都答错），少数正确回复的优势大
+3. **无需额外模型**：利用同一批次的其他采样作为基线，避免训练Critic
+4. **低偏差**：真实奖励的平均是值函数的无偏估计
+
+#### 9.1.5 配置关键参数
+
+```bash
+# train_search_agent.sh中的关键配置
+algorithm.adv_estimator=rloo              # 使用RLOO
+actor_rollout_ref.rollout.n=8            # 每问题采样8次
+trainer.critic_warmup=0                   # 不使用Critic预热
+data.train_batch_size=64                  # 64个问题
+# 实际训练轨迹数 = 64 × 8 = 512
+```
+
+---
+
+### 9.2 异步生成
 
 ```python
 # 使用AsyncAgentExecutionEngine并行处理多条轨迹
@@ -2295,11 +2759,14 @@ async def run_all_trajectories(n_trajectories):
 # 512条轨迹可以高度并行化，大幅提升效率
 ```
 
-### 9.2 动态批次大小
+### 9.3 动态批次大小
+
+**代码位置**: `train_search_agent.sh:36-37`
 
 ```python
 # 根据token数量动态调整mini-batch大小
-actor.ppo_max_token_len_per_gpu = 24000
+actor_rollout_ref.actor.use_dynamic_bsz=True  # 第36行
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24000  # 第37行
 
 # 如果某个batch的总token数超过限制，自动减小batch_size
 total_tokens = sum(len(seq) for seq in batch)
@@ -2307,24 +2774,37 @@ if total_tokens > ppo_max_token_len_per_gpu * world_size:
     batch = reduce_batch_size(batch)
 ```
 
-### 9.3 梯度检查点
+### 9.4 梯度检查点
+
+**代码位置**: `train_search_agent.sh:43`
 
 ```python
 # 节省显存
-actor_rollout_ref.model.enable_gradient_checkpointing = True
+actor_rollout_ref.model.enable_gradient_checkpointing=True  # 第43行
 
-# 权衡：减少显存占用，增加计算时间
+# 权衡：减少显存占用（约30-40%），增加计算时间（约20%）
+# 对于4B模型，可节省约3-4GB显存
 ```
 
-### 9.4 FSDP并行
+### 9.5 FSDP并行 + 参数卸载
+
+**代码位置**: `train_search_agent.sh:44-45, 68-69`
 
 ```python
 # 使用FSDP (Fully Sharded Data Parallel) 进行分布式训练
-actor_rollout_ref.actor.strategy = "fsdp"
-trainer.n_gpus_per_node = 2
-trainer.nnodes = 1
+actor_rollout_ref.actor.strategy="fsdp"  # 隐含配置
+trainer.n_gpus_per_node=2  # 第68行
+trainer.nnodes=1  # 第69行
 
-# 模型参数和优化器状态分片存储在2个GPU上
+# 关键优化：参数和优化器卸载到CPU
+actor_rollout_ref.actor.fsdp_config.param_offload=True  # 第44行
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=True  # 第45行
+
+# 效果：
+# - 模型参数分片存储在2个GPU上
+# - 不使用时的参数和优化器状态卸载到CPU内存
+# - 前向/反向传播时才加载到GPU
+# - 节省大量显存（约40-50GB），但增加10-15%计算时间
 ```
 
 ---
